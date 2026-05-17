@@ -463,30 +463,36 @@ class GatewayStreamConsumer:
                         continue
 
                     # Existing message: edit it with the first chunk, then
-                    # start a new message for the overflow remainder.
-                    while (
+                    # start new messages for overflow continuations. Reuse the
+                    # platform splitter so Markdown code fences stay balanced
+                    # across chunks.
+                    if (
                         _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
-                        _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
+                        chunks = self.adapter.truncate_message(
+                            self._accumulated, _safe_limit, len_fn=_len_fn,
                         )
-                        split_at = self._accumulated.rfind("\n", 0, _cp_budget)
-                        if split_at < _safe_limit // 2:
-                            split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
-                        ok = await self._send_or_edit(chunk)
-                        if self._fallback_final_send or not ok:
-                            # Edit failed (or backed off due to flood control)
-                            # while attempting to split an oversized message.
-                            # Keep the full accumulated text intact so the
-                            # fallback final-send path can deliver the remaining
-                            # continuation without dropping content.
-                            break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
-                        self._message_id = None
-                        self._last_sent_text = ""
+                        delivered = 0
+                        for idx, chunk in enumerate(chunks[:-1]):
+                            ok = await self._send_or_edit(chunk)
+                            if self._fallback_final_send or not ok:
+                                # Edit failed (or backed off due to flood control)
+                                # while attempting to split an oversized message.
+                                # Keep the full accumulated text intact so the
+                                # fallback final-send path can deliver the remaining
+                                # continuation without dropping content.
+                                delivered = 0
+                                break
+                            delivered += 1
+                            if idx < len(chunks) - 2:
+                                self._message_id = None
+                                self._last_sent_text = ""
+                        if delivered:
+                            self._accumulated = chunks[-1]
+                            self._message_id = None
+                            self._last_sent_text = ""
 
                     display_text = self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:

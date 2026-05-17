@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -1401,6 +1402,37 @@ class TestFilterAndAccumulateIntegration:
 
 
 # ── buffer_only mode tests ─────────────────────────────────────────────
+
+
+class TestMarkdownFenceOverflow:
+    @pytest.mark.asyncio
+    async def test_existing_message_overflow_keeps_code_fences_balanced(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 120
+        adapter.message_len_fn = len
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg-1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg-1")
+        )
+        adapter.truncate_message = BasePlatformAdapter.truncate_message
+
+        cfg = StreamConsumerConfig(edit_interval=999, buffer_threshold=40, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "chat-1", config=cfg)
+
+        await consumer._send_or_edit("💭 **Reasoning:**\n```\n" + "a" * 60)
+        consumer.on_delta("💭 **Reasoning:**\n```\n" + "a" * 60 + "b" * 720 + "\n```\n\nFinal answer.")
+        consumer.finish()
+
+        await consumer.run()
+
+        sent_contents = [call.kwargs["content"] for call in adapter.send.call_args_list]
+        edited_contents = [call.kwargs["content"] for call in adapter.edit_message.call_args_list]
+        chunks = edited_contents + sent_contents[1:]
+        assert len(chunks) >= 2
+        assert all(chunk.count("```") % 2 == 0 for chunk in chunks)
+        assert any(chunk.startswith("```") for chunk in chunks[1:])
 
 
 class TestBufferOnlyMode:
