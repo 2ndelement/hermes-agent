@@ -76,6 +76,10 @@ class _DeleteCapableAdapter(BasePlatformAdapter):
         return True
 
 
+class _AppendStreamingDeleteCapableAdapter(_DeleteCapableAdapter):
+    APPENDS_STREAMING_MESSAGE_UPDATES = True
+
+
 def _no_delete_adapter():
     return _NoDeleteAdapter(
         PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM
@@ -85,6 +89,12 @@ def _no_delete_adapter():
 def _delete_adapter():
     return _DeleteCapableAdapter(
         PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM
+    )
+
+
+def _append_streaming_delete_adapter():
+    return _AppendStreamingDeleteCapableAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform("qqbot-plus")
     )
 
 
@@ -266,6 +276,57 @@ async def test_process_message_unwraps_ephemeral_before_send():
     assert sent_text == "⚡ Stopped."
     # Auto-delete scheduled using the returned message_id
     assert ("42", "sent-1") in adapter.deleted
+
+
+@pytest.mark.asyncio
+async def test_process_message_ephemeral_reply_disables_append_streaming():
+    adapter = _append_streaming_delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="sent-1")
+    )
+
+    async def _handler(evt):
+        return EphemeralReply("✨ New session started", ttl_seconds=5)
+
+    adapter.set_message_handler(_handler)
+
+    event = _make_event(text="/new")
+    session_key = "agent:main:qqbot-plus:dm:42"
+    with patch("gateway.platforms.base.asyncio.sleep", AsyncMock()), patch.object(
+        adapter, "_keep_typing", new=AsyncMock()
+    ):
+        await adapter._process_message_background(event, session_key)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    adapter._send_with_retry.assert_called_once()
+    assert adapter._send_with_retry.call_args.kwargs["metadata"]["streaming"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_message_plain_reply_disables_append_streaming():
+    adapter = _append_streaming_delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="sent-1")
+    )
+
+    async def _handler(evt):
+        return "plain system reply"
+
+    adapter.set_message_handler(_handler)
+
+    event = _make_event(text="/unknown")
+    session_key = "agent:main:qqbot-plus:dm:42"
+    with patch("gateway.platforms.base.asyncio.sleep", AsyncMock()), patch.object(
+        adapter, "_keep_typing", new=AsyncMock()
+    ):
+        await adapter._process_message_background(event, session_key)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    adapter._send_with_retry.assert_called_once()
+    assert adapter._send_with_retry.call_args.kwargs["content"] == "plain system reply"
+    assert adapter._send_with_retry.call_args.kwargs["metadata"]["streaming"] is False
 
 
 @pytest.mark.asyncio

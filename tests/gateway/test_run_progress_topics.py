@@ -5,13 +5,15 @@ import importlib
 import sys
 import time
 import types
+from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig, StreamingConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -38,12 +40,13 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="progress-1")
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -61,8 +64,48 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         raise AssertionError("non-editable adapters should not receive edit_message calls")
+
+
+class AppendStreamingProgressCaptureAdapter(ProgressCaptureAdapter):
+    APPENDS_STREAMING_MESSAGE_UPDATES = True
+    REQUIRES_EDIT_FINALIZE = True
+
+
+class _CaptureHooks:
+    def __init__(self):
+        self.events = []
+        self.loaded_hooks = False
+
+    async def emit(self, name, payload):
+        self.events.append((name, payload))
+
+
+class _OneSessionStore:
+    def __init__(self, entry):
+        self.entry = entry
+        self.appended = []
+        self.updated = []
+        self.cleared_resume_pending = []
+
+    def get_or_create_session(self, source):
+        return self.entry
+
+    def load_transcript(self, session_id):
+        return []
+
+    def has_any_sessions(self):
+        return True
+
+    def append_to_transcript(self, session_id, entry, skip_db=False):
+        self.appended.append((session_id, entry, skip_db))
+
+    def update_session(self, session_key, **kwargs):
+        self.updated.append((session_key, kwargs))
+
+    def clear_resume_pending(self, session_key):
+        self.cleared_resume_pending.append(session_key)
 
 
 class FakeAgent:
@@ -156,7 +199,8 @@ def _make_runner(adapter):
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
-    runner.config = SimpleNamespace(
+    runner.config = GatewayConfig(
+        platforms={adapter.platform: PlatformConfig(enabled=True, token="***")},
         thread_sessions_per_user=False,
         group_sessions_per_user=False,
         stt_enabled=False,
@@ -209,6 +253,46 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_disables_append_streaming_for_system_bubbles(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
+
+    platform = Platform("qqbot-plus")
+    adapter = AppendStreamingProgressCaptureAdapter(platform=platform)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=platform,
+        chat_id="user-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-append-progress",
+        session_key="agent:main:qqbot-plus:dm:user-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["metadata"]["streaming"] is False
 
 
 @pytest.mark.asyncio
@@ -485,6 +569,7 @@ class PreviewedResponseAgent:
 class StreamingRefineAgent:
     def __init__(self, **kwargs):
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.model = "test-model"
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
@@ -496,6 +581,116 @@ class StreamingRefineAgent:
         return {
             "final_response": "Continuing to refine: Final answer.",
             "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+            "last_prompt_tokens": 20,
+            "context_length": 100,
+        }
+
+
+class ReasoningOnlyAgent:
+    def __init__(self, **kwargs):
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.reasoning_callback:
+            self.reasoning_callback("Only reasoning.")
+        return {
+            "final_response": "",
+            "response_previewed": True,
+            "last_reasoning": "Only reasoning.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ReasoningThenStreamingAgent:
+    def __init__(self, **kwargs):
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.reasoning_callback:
+            self.reasoning_callback("Check ```constraints```.")
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Final answer.")
+        return {
+            "final_response": "Final answer.",
+            "response_previewed": True,
+            "last_reasoning": "Check ```constraints```.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class UnsafeReasoningThenStreamingAgent:
+    def __init__(self, **kwargs):
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.reasoning_callback:
+            self.reasoning_callback(
+                "Before <memory-context>hidden system context</memory-context> "
+                "SECRET_TOKEN=sk-ant-abcdef1234567890"
+            )
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Final answer.")
+        return {
+            "final_response": "Final answer.",
+            "response_previewed": True,
+            "last_reasoning": "redacted",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SplitWhitespaceReasoningAgent:
+    def __init__(self, **kwargs):
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.reasoning_callback:
+            self.reasoning_callback("Step")
+            self.reasoning_callback(" ")
+            self.reasoning_callback("one")
+            self.reasoning_callback("\n")
+            self.reasoning_callback("Step two")
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Final answer.")
+        return {
+            "final_response": "Final answer.",
+            "response_previewed": True,
+            "last_reasoning": "Step one\nStep two",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ResumedReasoningAgent:
+    def __init__(self, **kwargs):
+        self.reasoning_callback = kwargs.get("reasoning_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.reasoning_callback:
+            self.reasoning_callback("First thought.")
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Visible answer.")
+        if self.reasoning_callback:
+            self.reasoning_callback("Second thought.")
+        if self.stream_delta_callback:
+            self.stream_delta_callback(" More answer.")
+        return {
+            "final_response": "Visible answer. More answer.",
+            "response_previewed": True,
+            "last_reasoning": "First thought. Second thought.",
             "messages": [],
             "api_calls": 1,
         }
@@ -764,6 +959,223 @@ async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_pat
 
     assert result.get("already_sent") is True
     assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_append_streaming_agent_content_does_not_opt_out(monkeypatch, tmp_path):
+    platform = Platform("qqbot-plus")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-append-agent-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=platform,
+        chat_id="user-1",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=AppendStreamingProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert adapter.sent
+    assert all(call["metadata"] is None for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_streams_reasoning_before_final_answer(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReasoningThenStreamingAgent,
+        session_id="sess-reasoning-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "show_reasoning": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    joined = "\n".join(all_text)
+    assert "💭 **Reasoning:**" in joined
+    assert "Check '''constraints'''." in joined
+    assert "Final answer." in joined
+    assert joined.index("Check '''constraints'''.") < joined.index("Final answer.")
+
+
+@pytest.mark.asyncio
+async def test_run_agent_closes_reasoning_when_no_final_text(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReasoningOnlyAgent,
+        session_id="sess-reasoning-only-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "show_reasoning": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    joined = "\n".join(all_text)
+    assert "Only reasoning." in joined
+    assert joined.rstrip().endswith("```")
+
+
+@pytest.mark.asyncio
+async def test_run_agent_sanitizes_reasoning_before_streaming(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        UnsafeReasoningThenStreamingAgent,
+        session_id="sess-reasoning-sanitized-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "show_reasoning": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    joined = "\n".join(all_text)
+    assert "Before" in joined
+    assert "hidden system context" not in joined
+    assert "sk-ant-abcdef1234567890" not in joined
+    assert "***" in joined
+    assert "```\n\n" in joined
+    assert "```Final answer." not in joined
+    assert "```\nFinal answer." not in joined
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_reasoning_whitespace_chunks(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SplitWhitespaceReasoningAgent,
+        session_id="sess-reasoning-whitespace-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "show_reasoning": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    joined = "\n".join(all_text)
+    assert "```\nStep one\nStep two" in joined
+
+
+@pytest.mark.asyncio
+async def test_run_agent_reopens_reasoning_block_after_answer_delta(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ResumedReasoningAgent,
+        session_id="sess-reasoning-resumed-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "show_reasoning": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    joined = "\n".join(all_text)
+    assert joined.count("💭 **Reasoning:**") == 2
+    assert "Visible answer.💭 **Reasoning:**" not in joined
+    assert "💭 **Reasoning:**\n```\nSecond thought." in joined
+
+
+@pytest.mark.asyncio
+async def test_handle_message_sends_runtime_footer_as_plain_message_for_append_streaming(
+    monkeypatch,
+    tmp_path,
+):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": ["model", "context"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("QQBOT_PLUS_HOME_CHANNEL", "user-1")
+
+    platform = Platform("qqbot-plus")
+    adapter = AppendStreamingProgressCaptureAdapter(platform=platform)
+    runner = _make_runner(adapter)
+    entry = SessionEntry(
+        session_key="agent:main:qqbot-plus:dm:user-1",
+        session_id="sess-footer",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=SessionSource(platform=platform, chat_id="user-1", chat_type="dm"),
+        platform=platform,
+    )
+    runner.session_store = _OneSessionStore(entry)
+    runner.hooks = _CaptureHooks()
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._is_telegram_topic_lane = lambda source: False
+    runner._cache_session_source = lambda session_key, source: None
+    runner._set_session_env = lambda context: []
+    runner._clear_session_env = lambda tokens: None
+    runner._prepare_inbound_message_text = AsyncMock(return_value="hello")
+    runner._bind_adapter_run_generation = lambda adapter, session_key, generation: None
+    runner._is_session_run_current = lambda quick_key, generation: True
+    runner._clear_restart_failure_count = lambda session_key: None
+    runner._should_send_voice_reply = lambda event, response, messages, already_sent=False: False
+    runner._deliver_media_from_response = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Final answer.",
+            "already_sent": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+            "model": "test-model",
+            "last_prompt_tokens": 20,
+            "context_length": 100,
+        }
+    )
+
+    source = SessionSource(platform=platform, chat_id="user-1", chat_type="dm")
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="event-1",
+    )
+
+    result = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:qqbot-plus:dm:user-1",
+        1,
+    )
+
+    assert result is None
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "user-1"
+    assert adapter.sent[0]["content"] == "test-model"
+    assert adapter.sent[0]["reply_to"] is None
+    assert adapter.sent[0]["metadata"] == {"streaming": False}
 
 
 @pytest.mark.asyncio

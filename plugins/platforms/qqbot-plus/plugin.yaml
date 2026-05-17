@@ -1,0 +1,33 @@
+name: qqbot-plus-platform
+label: QQBot Plus
+kind: platform
+version: 1.0.0
+description: >
+  Decoupled QQ Bot Plus gateway adapter with native QQ v2 append-style streaming.
+author: local
+requires_env:
+  - name: QQBOT_PLUS_APP_ID
+    description: "QQBot Plus app ID"
+    prompt: "QQBot Plus app ID"
+    password: false
+  - name: QQBOT_PLUS_CLIENT_SECRET
+    description: "QQBot Plus client secret"
+    prompt: "QQBot Plus client secret"
+    password: true
+optional_env:
+  - name: QQBOT_PLUS_ENABLED
+    description: "Enable QQBot Plus platform"
+    prompt: "Enable QQBot Plus? (true/false)"
+    password: false
+  - name: QQBOT_PLUS_HOME_CHANNEL
+    description: "Default C2C or group openid for cron delivery"
+    prompt: "QQBot Plus home channel"
+    password: false
+  - name: QQ_ALLOWED_USERS
+    description: "Comma-separated QQ user openids allowed to talk to the bot"
+    prompt: "Allowed QQ users"
+    password: false
+  - name: QQ_ALLOW_ALL_USERS
+    description: "Allow any QQ user (dev only)"
+    prompt: "Allow all QQ users? (true/false)"
+    password: false

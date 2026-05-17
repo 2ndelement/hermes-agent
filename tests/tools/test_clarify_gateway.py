@@ -85,6 +85,25 @@ class TestClarifyPrimitive:
 
         assert cm.mark_awaiting_text("nope") is False
 
+    def test_get_choice_for_clarify_returns_original_choice(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-choice", "sk-choice", "Pick", ["Alpha", "Beta"])
+
+        assert cm.get_choice_for_clarify("id-choice", 0) == "Alpha"
+        assert cm.get_choice_for_clarify("id-choice", 1) == "Beta"
+
+    def test_get_choice_for_clarify_rejects_invalid_lookup(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-choice", "sk-choice", "Pick", ["Alpha"])
+        cm.register("id-open", "sk-open", "Type", None)
+
+        assert cm.get_choice_for_clarify("id-choice", -1) is None
+        assert cm.get_choice_for_clarify("id-choice", 1) is None
+        assert cm.get_choice_for_clarify("id-open", 0) is None
+        assert cm.get_choice_for_clarify("missing", 0) is None
+
     def test_timeout_returns_none(self):
         """wait_for_response returns None when no resolve fires within the timeout."""
         from tools import clarify_gateway as cm

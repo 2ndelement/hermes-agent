@@ -132,6 +132,7 @@ from gateway.platforms.qqbot.keyboards import (
     build_approval_keyboard,
     build_update_prompt_keyboard,
     parse_approval_button_data,
+    parse_clarify_button_data,
     parse_interaction_event,
     parse_update_prompt_button_data,
 )
@@ -1036,6 +1037,41 @@ class QQAdapter(BasePlatformAdapter):
         update_answer = parse_update_prompt_button_data(button_data)
         if update_answer is not None:
             self._write_update_response(update_answer, event.operator_openid)
+            return
+
+        clarify = parse_clarify_button_data(button_data)
+        if clarify is not None:
+            clarify_id, choice_token = clarify
+            try:
+                from tools.clarify_gateway import (
+                    get_choice_for_clarify,
+                    mark_awaiting_text,
+                    resolve_gateway_clarify,
+                )
+                if choice_token == "other":
+                    marked = mark_awaiting_text(clarify_id)
+                    logger.info(
+                        "[%s] Clarify button selected free-text mode id=%s marked=%s operator=%s",
+                        self._log_tag, clarify_id, marked, event.operator_openid,
+                    )
+                    return
+                choice = get_choice_for_clarify(clarify_id, int(choice_token))
+                if choice is None:
+                    logger.warning(
+                        "[%s] Clarify button referenced unknown choice id=%s token=%s",
+                        self._log_tag, clarify_id, choice_token,
+                    )
+                    return
+                resolved = resolve_gateway_clarify(clarify_id, choice)
+                logger.info(
+                    "[%s] Clarify button resolved id=%s resolved=%s operator=%s",
+                    self._log_tag, clarify_id, resolved, event.operator_openid,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] resolve_gateway_clarify failed for id %s: %s",
+                    self._log_tag, clarify_id, exc,
+                )
             return
 
         logger.debug(

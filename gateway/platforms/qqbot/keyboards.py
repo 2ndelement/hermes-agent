@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 APPROVAL_BUTTON_PREFIX = "approve:"
 UPDATE_PROMPT_PREFIX = "update_prompt:"
+CLARIFY_BUTTON_PREFIX = "clarify:"
 
 # Pattern: approve:<session_key>:<decision>
 # session_key may itself contain colons (e.g. agent:main:qqbot:c2c:OPENID),
@@ -50,6 +51,9 @@ _APPROVAL_DATA_RE = re.compile(
 
 # Pattern: update_prompt:y | update_prompt:n
 _UPDATE_PROMPT_RE = re.compile(r"^update_prompt:(y|n)$")
+
+# Pattern: clarify:<clarify_id>:<index|other>
+_CLARIFY_DATA_RE = re.compile(r"^clarify:([^:]+):(\d+|other)$")
 
 
 # ── Keyboard dataclasses ─────────────────────────────────────────────
@@ -179,6 +183,14 @@ def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
     return m.group(1)
 
 
+def parse_clarify_button_data(button_data: str) -> Optional[tuple[str, str]]:
+    """Parse clarify ``button_data`` into ``(clarify_id, index_or_other)``."""
+    m = _CLARIFY_DATA_RE.match(button_data or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
 # ── Keyboard builders ────────────────────────────────────────────────
 
 def _make_callback_button(
@@ -199,6 +211,41 @@ def _make_callback_button(
         action=KeyboardButtonAction(type=1, data=data),
         group_id=group_id,
     )
+
+
+def _truncate_button_label(text: str, limit: int = 30) -> str:
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def build_clarify_keyboard(clarify_id: str, choices: List[str]) -> InlineKeyboard:
+    rows: List[KeyboardRow] = []
+    group_id = "clarify"
+    for idx, choice in enumerate(choices):
+        label = f"{idx + 1}. {_truncate_button_label(choice)}"
+        rows.append(KeyboardRow(buttons=[
+            _make_callback_button(
+                btn_id=f"choice-{idx}",
+                label=label,
+                visited_label="已选择",
+                data=f"{CLARIFY_BUTTON_PREFIX}{clarify_id}:{idx}",
+                style=1,
+                group_id=group_id,
+            )
+        ]))
+    rows.append(KeyboardRow(buttons=[
+        _make_callback_button(
+            btn_id="other",
+            label="✏️ 其他/手动输入",
+            visited_label="请手动回复",
+            data=f"{CLARIFY_BUTTON_PREFIX}{clarify_id}:other",
+            style=0,
+            group_id=group_id,
+        )
+    ]))
+    return InlineKeyboard(content=KeyboardContent(rows=rows))
 
 
 def build_approval_keyboard(session_key: str) -> InlineKeyboard:

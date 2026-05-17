@@ -35,9 +35,9 @@ class _MediaRoutingAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
-def _event(thread_id=None):
+def _event(thread_id=None, platform=Platform.TELEGRAM):
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         chat_id="chat-1",
         chat_type="dm",
         thread_id=thread_id,
@@ -203,3 +203,53 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_delivery_routes_qqbot_plus_generated_media_by_type():
+    event = _event(platform=Platform("qqbot-plus"))
+    adapter = SimpleNamespace(
+        name="qqbot-plus",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_multiple_images=AsyncMock(return_value=None),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None),
+        "\n".join(
+            [
+                "MEDIA:/tmp/image.png",
+                "MEDIA:/tmp/speech.mp3",
+                "MEDIA:/tmp/clip.mp4",
+                "MEDIA:/tmp/report.pdf",
+            ]
+        ),
+        event,
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once_with(
+        chat_id="chat-1",
+        images=[("file:///tmp/image.png", "")],
+        metadata=None,
+    )
+    adapter.send_voice.assert_awaited_once_with(
+        chat_id="chat-1",
+        audio_path="/tmp/speech.mp3",
+        metadata=None,
+    )
+    adapter.send_video.assert_awaited_once_with(
+        chat_id="chat-1",
+        video_path="/tmp/clip.mp4",
+        metadata=None,
+    )
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path="/tmp/report.pdf",
+        metadata=None,
+    )

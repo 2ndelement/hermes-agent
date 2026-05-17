@@ -1185,6 +1185,14 @@ class GatewayStreamConsumer:
                         self._flood_strikes = 0
                         return True
                     else:
+                        if (
+                            finalize
+                            and self._adapter_requires_finalize
+                            and getattr(self.adapter, "APPENDS_STREAMING_MESSAGE_UPDATES", False) is True
+                            and self._already_sent
+                        ):
+                            self._final_response_sent = True
+                            return True
                         # Edit failed.  If this looks like flood control / rate
                         # limiting, use adaptive backoff: double the edit interval
                         # and retry on the next cycle.  Only permanently disable
@@ -1266,4 +1274,12 @@ class GatewayStreamConsumer:
                     return False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+            if (
+                finalize
+                and self._adapter_requires_finalize
+                and getattr(self.adapter, "APPENDS_STREAMING_MESSAGE_UPDATES", False) is True
+                and self._already_sent
+            ):
+                self._final_response_sent = True
+                return True
             return False

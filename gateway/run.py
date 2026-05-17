@@ -51,6 +51,8 @@ from typing import Dict, Optional, Any, List, Union
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.memory_manager import sanitize_context
+from agent.redact import redact_sensitive_text
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -2487,7 +2489,9 @@ class GatewayRunner:
                 return True
 
             reply_anchor = self._reply_anchor_for_event(event)
-            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            thread_meta = adapter._metadata_for_system_reply(
+                self._thread_metadata_for_source(event.source, reply_anchor)
+            )
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
@@ -2641,7 +2645,9 @@ class GatewayRunner:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
         reply_anchor = self._reply_anchor_for_event(event)
-        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        thread_meta = adapter._metadata_for_system_reply(
+            self._thread_metadata_for_source(event.source, reply_anchor)
+        )
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -2773,7 +2779,9 @@ class GatewayRunner:
 
                 # Include thread_id if present so the message lands in the
                 # correct forum topic / thread.
-                metadata = {"thread_id": thread_id} if thread_id else None
+                metadata = adapter._metadata_for_system_reply(
+                    {"thread_id": thread_id} if thread_id else None
+                )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -2819,11 +2827,10 @@ class GatewayRunner:
                 continue
 
             try:
-                metadata = {"thread_id": home.thread_id} if home.thread_id else None
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                metadata = adapter._metadata_for_system_reply(
+                    {"thread_id": home.thread_id} if home.thread_id else None
+                )
+                result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
@@ -4346,6 +4353,7 @@ class GatewayRunner:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        metadata = adapter._metadata_for_system_reply(metadata)
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
@@ -5628,7 +5636,9 @@ class GatewayRunner:
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
 
-        metadata = self._thread_metadata_for_source(source)
+        metadata = adapter._metadata_for_system_reply(
+            self._thread_metadata_for_source(source)
+        )
         if notice_delivery == "private" and getattr(source, "user_id", None):
             try:
                 result = await adapter.send_private_notice(
@@ -7106,7 +7116,9 @@ class GatewayRunner:
                             pass
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=self._thread_metadata_for_source(source),
+                            metadata=adapter._metadata_for_system_reply(
+                                self._thread_metadata_for_source(source)
+                            ),
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -7423,7 +7435,11 @@ class GatewayRunner:
                                         try:
                                             _adapter = self.adapters.get(source.platform)
                                             if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
+                                                await _adapter.send(
+                                                    source.chat_id,
+                                                    _warn_msg,
+                                                    metadata=_adapter._metadata_for_system_reply(_hyg_meta),
+                                                )
                                         except Exception as _werr:
                                             logger.warning(
                                                 "Failed to deliver compression-failure warning to user: %s",
@@ -7447,7 +7463,11 @@ class GatewayRunner:
                                         try:
                                             _adapter = self.adapters.get(source.platform)
                                             if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
+                                                await _adapter.send(
+                                                    source.chat_id,
+                                                    _aux_msg,
+                                                    metadata=_adapter._metadata_for_system_reply(_hyg_meta),
+                                                )
                                         except Exception as _werr:
                                             logger.warning(
                                                 "Failed to deliver aux-model-fallback notice to user: %s",
@@ -7899,10 +7919,15 @@ class GatewayRunner:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
+                            _footer_metadata = _foot_adapter._metadata_for_system_reply(
+                                self._thread_metadata_for_source(
+                                    source, self._reply_anchor_for_event(event)
+                                )
+                            )
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=_footer_metadata,
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
@@ -9034,7 +9059,9 @@ class GatewayRunner:
                         lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
 
-                    metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    metadata = adapter._metadata_for_system_reply(
+                        self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    )
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -9450,7 +9477,11 @@ class GatewayRunner:
         except Exception:
             metadata = None
 
-        result = await adapter.send(source.chat_id, message, metadata=metadata)
+        result = await adapter.send(
+            source.chat_id,
+            message,
+            metadata=adapter._metadata_for_system_reply(metadata),
+        )
         if result is not None and not getattr(result, "success", True):
             logger.warning(
                 "goal continuation: status send failed: %s",
@@ -12098,6 +12129,8 @@ class GatewayRunner:
 
         adapter = self.adapters.get(source.platform)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+        if adapter is not None:
+            metadata = adapter._metadata_for_system_reply(metadata)
 
         used_buttons = False
         if adapter is not None:
@@ -12524,6 +12557,9 @@ class GatewayRunner:
                 except Exception:
                     pass
 
+        if adapter:
+            metadata = adapter._metadata_for_system_reply(metadata)
+
         if not adapter or not chat_id:
             logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
             # Fall back to old behavior: wait for exit code and send final notification
@@ -12742,7 +12778,9 @@ class GatewayRunner:
             adapter = self.adapters.get(platform)
 
             if adapter and chat_id:
-                metadata = {"thread_id": thread_id} if thread_id else None
+                metadata = adapter._metadata_for_system_reply(
+                    {"thread_id": thread_id} if thread_id else None
+                )
                 # Strip ANSI escape codes for clean display
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
                 if output:
@@ -12806,7 +12844,9 @@ class GatewayRunner:
                 )
                 return None
 
-            metadata = {"thread_id": thread_id} if thread_id else None
+            metadata = adapter._metadata_for_system_reply(
+                {"thread_id": thread_id} if thread_id else None
+            )
             result = await adapter.send(
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
@@ -12870,11 +12910,10 @@ class GatewayRunner:
                 continue
 
             try:
-                metadata = {"thread_id": home.thread_id} if home.thread_id else None
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), message, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), message)
+                metadata = adapter._metadata_for_system_reply(
+                    {"thread_id": home.thread_id} if home.thread_id else None
+                )
+                result = await adapter.send(str(home.chat_id), message, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
@@ -13342,7 +13381,9 @@ class GatewayRunner:
                             break
                     if adapter and chat_id:
                         try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
+                            send_meta = adapter._metadata_for_system_reply(
+                                {"thread_id": thread_id} if thread_id else None
+                            )
                             await adapter.send(chat_id, message_text, metadata=send_meta)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
@@ -13363,7 +13404,9 @@ class GatewayRunner:
                         break
                 if adapter and chat_id:
                     try:
-                        send_meta = {"thread_id": thread_id} if thread_id else None
+                        send_meta = adapter._metadata_for_system_reply(
+                            {"thread_id": thread_id} if thread_id else None
+                        )
                         await adapter.send(chat_id, message_text, metadata=send_meta)
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
@@ -14406,6 +14449,9 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        _progress_adapter = self.adapters.get(source.platform)
+        if _progress_adapter:
+            _progress_metadata = _progress_adapter._metadata_for_system_reply(_progress_metadata)
         _progress_reply_to = (
             event_message_id
             if source.platform == Platform.FEISHU and source.thread_id and event_message_id
@@ -14666,6 +14712,9 @@ class GatewayRunner:
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _stream_thread_metadata = _status_thread_metadata
+        if _status_adapter:
+            _status_thread_metadata = _status_adapter._metadata_for_system_reply(_status_thread_metadata)
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -14754,6 +14803,7 @@ class GatewayRunner:
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
+            _reasoning_delta_cb = None
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
             if _scfg is None:
                 from gateway.config import StreamingConfig
@@ -14817,7 +14867,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_stream_thread_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
@@ -14826,9 +14876,48 @@ class GatewayRunner:
                             initial_reply_to_id=event_message_id,
                         )
                         if _want_stream_deltas:
+                            _reasoning_started = False
+                            _reasoning_closed = False
+                            _answer_stream_started = False
+
+                            def _close_reasoning_segment() -> None:
+                                nonlocal _reasoning_started, _reasoning_closed
+                                if _reasoning_started and not _reasoning_closed:
+                                    _stream_consumer.on_delta("\n```\n\n")
+                                    _stream_consumer.on_segment_break()
+                                _reasoning_started = False
+                                _reasoning_closed = False
+
                             def _stream_delta_cb(text: str) -> None:
+                                nonlocal _answer_stream_started
                                 if _run_still_current():
+                                    _close_reasoning_segment()
                                     _stream_consumer.on_delta(text)
+                                    if text:
+                                        _answer_stream_started = True
+                            try:
+                                _show_reasoning_for_stream = resolve_display_setting(
+                                    user_config,
+                                    platform_key,
+                                    "show_reasoning",
+                                    getattr(self, "_show_reasoning", False),
+                                )
+                            except Exception:
+                                _show_reasoning_for_stream = getattr(self, "_show_reasoning", False)
+                            if _show_reasoning_for_stream:
+                                def _reasoning_delta_cb(text: str) -> None:
+                                    nonlocal _reasoning_started
+                                    safe_text = sanitize_context(str(text or ""))
+                                    safe_text = redact_sensitive_text(safe_text, force=True)
+                                    safe_text = safe_text.replace("```", "'''")
+                                    if not _run_still_current() or not safe_text:
+                                        return
+                                    if not _reasoning_started:
+                                        if _answer_stream_started:
+                                            _stream_consumer.on_segment_break()
+                                        _reasoning_started = True
+                                        _stream_consumer.on_delta("💭 **Reasoning:**\n```\n")
+                                    _stream_consumer.on_delta(safe_text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -14837,6 +14926,8 @@ class GatewayRunner:
                 if not _run_still_current():
                     return
                 if _stream_consumer is not None:
+                    if _reasoning_delta_cb is not None:
+                        _close_reasoning_segment()
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
@@ -14930,6 +15021,7 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
+            agent.reasoning_callback = _reasoning_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
@@ -15343,6 +15435,8 @@ class GatewayRunner:
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
+                if _reasoning_delta_cb is not None:
+                    _close_reasoning_segment()
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong

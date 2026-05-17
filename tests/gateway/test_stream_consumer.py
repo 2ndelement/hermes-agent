@@ -99,6 +99,59 @@ class TestFinalizeCapabilityGate:
     """
 
     @pytest.mark.asyncio
+    async def test_finalize_failure_after_visible_append_stream_suppresses_gateway_fallback(self):
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.APPENDS_STREAMING_MESSAGE_UPDATES = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="stream-1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="finalize failed"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat-1")
+        await consumer._send_or_edit("hello")
+        ok = await consumer._send_or_edit("hello", finalize=True)
+
+        assert ok is True
+        assert consumer.final_response_sent is True
+        assert consumer.already_sent is True
+        adapter.edit_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_exception_after_visible_append_stream_suppresses_gateway_fallback(self):
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.APPENDS_STREAMING_MESSAGE_UPDATES = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="stream-1"))
+        adapter.edit_message = AsyncMock(side_effect=RuntimeError("stream ended"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat-1")
+        await consumer._send_or_edit("hello")
+        ok = await consumer._send_or_edit("hello", finalize=True)
+
+        assert ok is True
+        assert consumer.final_response_sent is True
+        assert consumer.already_sent is True
+        adapter.edit_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_exception_without_visible_append_stream_does_not_suppress(self):
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.APPENDS_STREAMING_MESSAGE_UPDATES = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=False, error="network down"))
+        adapter.edit_message = AsyncMock(side_effect=RuntimeError("stream ended"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat-1")
+        ok = await consumer._send_or_edit("hello", finalize=True)
+
+        assert ok is False
+        assert consumer.final_response_sent is False
+        assert consumer.already_sent is False
+        adapter.edit_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_identical_text_skip_respects_adapter_flag(self):
         """_send_or_edit short-circuits identical-text only when the
         adapter doesn't require an explicit finalize signal."""

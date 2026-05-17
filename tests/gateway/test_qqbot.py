@@ -1009,6 +1009,25 @@ class TestApprovalButtonData:
         assert parse_approval_button_data(None) is None  # type: ignore[arg-type]
 
 
+class TestClarifyButtonData:
+    def test_parse_choice_index(self):
+        from gateway.platforms.qqbot.keyboards import parse_clarify_button_data
+
+        assert parse_clarify_button_data("clarify:cid-1:0") == ("cid-1", "0")
+
+    def test_parse_other(self):
+        from gateway.platforms.qqbot.keyboards import parse_clarify_button_data
+
+        assert parse_clarify_button_data("clarify:cid-1:other") == ("cid-1", "other")
+
+    def test_parse_wrong_prefix_returns_none(self):
+        from gateway.platforms.qqbot.keyboards import parse_clarify_button_data
+
+        assert parse_clarify_button_data("approve:sess:deny") is None
+        assert parse_clarify_button_data("update_prompt:y") is None
+        assert parse_clarify_button_data("") is None
+
+
 class TestUpdatePromptButtonData:
     def test_parse_yes(self):
         from gateway.platforms.qqbot.keyboards import parse_update_prompt_button_data
@@ -1074,6 +1093,38 @@ class TestBuildApprovalKeyboard:
             assert parsed is not None
             assert parsed[0] == session_key
             assert parsed[1] in ("allow-once", "allow-always", "deny")
+
+
+class TestBuildClarifyKeyboard:
+    def test_choices_and_other_button(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+
+        kb = build_clarify_keyboard("cid-1", ["Alpha", "Beta"])
+        rows = kb.content.rows
+
+        assert len(rows) == 3
+        assert rows[0].buttons[0].action.data == "clarify:cid-1:0"
+        assert rows[1].buttons[0].action.data == "clarify:cid-1:1"
+        assert rows[2].buttons[0].action.data == "clarify:cid-1:other"
+        assert "Alpha" in rows[0].buttons[0].render_data.label
+        assert "手动" in rows[2].buttons[0].render_data.label
+
+    def test_group_id_uses_qq_safe_characters(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+
+        kb = build_clarify_keyboard("cid-1", ["Alpha", "Beta"])
+        group_ids = {button.group_id for row in kb.content.rows for button in row.buttons}
+
+        assert group_ids == {"clarify"}
+
+    def test_long_choice_label_is_truncated_but_payload_uses_index(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+
+        kb = build_clarify_keyboard("cid-1", ["x" * 100])
+        button = kb.content.rows[0].buttons[0]
+
+        assert len(button.render_data.label) < 100
+        assert button.action.data == "clarify:cid-1:0"
 
 
 class TestBuildUpdatePromptKeyboard:
@@ -1662,6 +1713,57 @@ class TestDefaultInteractionDispatch:
         await adapter._default_interaction_dispatch(event)
         response = hermes_home / ".update_response"
         assert response.read_text() == "n"
+
+    @pytest.mark.asyncio
+    async def test_clarify_choice_click_resolves_original_choice(self):
+        adapter = self._make_adapter()
+        from tools import clarify_gateway as cm
+
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+        cm.register("cid-1", "sk-1", "Pick", ["Alpha", "Beta"])
+
+        from gateway.platforms.qqbot.keyboards import parse_interaction_event
+        event = parse_interaction_event({
+            "id": "i", "chat_type": 2, "user_openid": "u",
+            "data": {"resolved": {"button_data": "clarify:cid-1:1"}},
+        })
+        await adapter._default_interaction_dispatch(event)
+
+        assert cm.wait_for_response("cid-1", timeout=0.1) == "Beta"
+
+    @pytest.mark.asyncio
+    async def test_clarify_other_click_enters_text_capture_mode(self):
+        adapter = self._make_adapter()
+        from tools import clarify_gateway as cm
+
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+        cm.register("cid-2", "sk-2", "Pick", ["Alpha", "Beta"])
+
+        from gateway.platforms.qqbot.keyboards import parse_interaction_event
+        event = parse_interaction_event({
+            "id": "i", "chat_type": 2, "user_openid": "u",
+            "data": {"resolved": {"button_data": "clarify:cid-2:other"}},
+        })
+        await adapter._default_interaction_dispatch(event)
+
+        pending = cm.get_pending_for_session("sk-2")
+        assert pending is not None
+        assert pending.clarify_id == "cid-2"
+
+    @pytest.mark.asyncio
+    async def test_unknown_clarify_choice_is_harmless(self):
+        adapter = self._make_adapter()
+
+        from gateway.platforms.qqbot.keyboards import parse_interaction_event
+        event = parse_interaction_event({
+            "id": "i", "chat_type": 2, "user_openid": "u",
+            "data": {"resolved": {"button_data": "clarify:missing:0"}},
+        })
+        await adapter._default_interaction_dispatch(event)
 
     @pytest.mark.asyncio
     async def test_unknown_button_data_is_harmless(self):

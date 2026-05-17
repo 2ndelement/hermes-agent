@@ -193,6 +193,17 @@ def mark_awaiting_text(clarify_id: str) -> bool:
         return True
 
 
+def get_choice_for_clarify(clarify_id: str, idx: int) -> Optional[str]:
+    """Return the original choice string for a pending clarify button index."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or not entry.choices:
+            return None
+        if idx < 0 or idx >= len(entry.choices):
+            return None
+        return entry.choices[idx]
+
+
 def has_pending(session_key: str) -> bool:
     """Return True when this session has at least one pending clarify entry."""
     with _lock:

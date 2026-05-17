@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -547,7 +548,34 @@ class TestSendToPlatformChunking:
 
         assert result["success"] is True
         helper.assert_not_awaited()
-        lightweight.assert_awaited_once()
+
+    def test_plugin_platform_media_only_routes_via_adapter(self):
+        helper = AsyncMock(return_value={"success": True, "message_id": "plugin-media-1"})
+        media = [("/tmp/photo.png", False)]
+        pconfig = SimpleNamespace(enabled=True, token="***", extra={})
+        platform = Platform("qqbot-plus")
+
+        with patch("tools.send_message_tool._send_via_adapter", helper):
+            result = asyncio.run(
+                _send_to_platform(
+                    platform,
+                    pconfig,
+                    "user-openid",
+                    "",
+                    media_files=media,
+                )
+            )
+
+        assert result["success"] is True
+        helper.assert_awaited_once_with(
+            platform,
+            pconfig,
+            "user-openid",
+            "",
+            thread_id=None,
+            media_files=media,
+            force_document=False,
+        )
 
     def test_send_matrix_via_adapter_sends_document(self, tmp_path):
         file_path = tmp_path / "report.pdf"
@@ -2088,6 +2116,211 @@ class TestSendViaAdapterStandaloneFallback:
         )
 
     @pytest.mark.asyncio
+    async def test_live_adapter_sends_on_gateway_loop(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platforms.base import SendResult
+
+        gateway_loop = asyncio.new_event_loop()
+        started = threading.Event()
+
+        def run_loop():
+            asyncio.set_event_loop(gateway_loop)
+            started.set()
+            gateway_loop.run_forever()
+
+        thread = threading.Thread(target=run_loop, daemon=True)
+        thread.start()
+        assert started.wait(timeout=1)
+
+        class FakeAdapter:
+            def __init__(self):
+                self.loop_ids = []
+
+            async def send(self, **kwargs):
+                self.loop_ids.append(id(asyncio.get_running_loop()))
+                return SendResult(success=True, message_id="text-1")
+
+        platform = _FakePlatform("qqbot-plus")
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(adapters={platform: adapter}, _gateway_loop=gateway_loop)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        try:
+            result = await _send_via_adapter(
+                platform,
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "caption",
+            )
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            thread.join(timeout=1)
+            gateway_loop.close()
+
+        assert result == {"success": True, "message_id": "text-1"}
+        assert adapter.loop_ids == [id(gateway_loop)]
+
+    @pytest.mark.asyncio
+    async def test_live_adapter_media_files_dispatch_by_type(self, monkeypatch, tmp_path):
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platforms.base import SendResult
+
+        image = tmp_path / "image.png"
+        audio = tmp_path / "voice.ogg"
+        video = tmp_path / "clip.mp4"
+        document = tmp_path / "report.pdf"
+        for path in (image, audio, video, document):
+            path.write_bytes(b"media")
+
+        class FakeAdapter:
+            APPENDS_STREAMING_MESSAGE_UPDATES = True
+
+            def __init__(self):
+                self.calls = []
+
+            async def send(self, **kwargs):
+                self.calls.append(("send", kwargs))
+                return SendResult(success=True, message_id="text-1")
+
+            async def send_image_file(self, **kwargs):
+                self.calls.append(("send_image_file", kwargs))
+                return SendResult(success=True, message_id="image-1")
+
+            async def send_voice(self, **kwargs):
+                self.calls.append(("send_voice", kwargs))
+                return SendResult(success=True, message_id="voice-1")
+
+            async def send_video(self, **kwargs):
+                self.calls.append(("send_video", kwargs))
+                return SendResult(success=True, message_id="video-1")
+
+            async def send_document(self, **kwargs):
+                self.calls.append(("send_document", kwargs))
+                return SendResult(success=True, message_id="doc-1")
+
+        platform = _FakePlatform("qqbot-plus")
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(adapters={platform: adapter})
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = await _send_via_adapter(
+            platform,
+            SimpleNamespace(extra={}),
+            "chat-1",
+            "caption",
+            media_files=[
+                (str(image), False),
+                (str(audio), True),
+                (str(video), False),
+                (str(document), False),
+            ],
+        )
+
+        assert result == {"success": True, "message_id": "doc-1"}
+        assert [name for name, _kwargs in adapter.calls] == [
+            "send",
+            "send_image_file",
+            "send_voice",
+            "send_video",
+            "send_document",
+        ]
+        assert adapter.calls[0][1]["content"] == "caption"
+        assert adapter.calls[1][1]["image_path"] == str(image)
+        assert adapter.calls[2][1]["audio_path"] == str(audio)
+        assert adapter.calls[3][1]["video_path"] == str(video)
+        assert adapter.calls[4][1]["file_path"] == str(document)
+        assert [kwargs["metadata"] for _name, kwargs in adapter.calls] == [
+            {"streaming": False},
+            {"streaming": False},
+            {"streaming": False},
+            {"streaming": False},
+            {"streaming": False},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_adapter_lookup_falls_back_to_platform_value(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platforms.base import SendResult
+
+        class FakeAdapter:
+            def __init__(self):
+                self.send = AsyncMock(
+                    return_value=SendResult(success=True, message_id="text-1")
+                )
+
+        platform = _FakePlatform("qqbot-plus")
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(adapters={"qqbot-plus": adapter})
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = await _send_via_adapter(
+            platform,
+            SimpleNamespace(extra={}),
+            "chat-1",
+            "caption",
+        )
+
+        assert result == {"success": True, "message_id": "text-1"}
+        adapter.send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="caption",
+            metadata=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_payload_returns_error(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = _FakePlatform("qqbot-plus")
+        adapter = SimpleNamespace(send=AsyncMock())
+        runner = SimpleNamespace(adapters={platform: adapter})
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = await _send_via_adapter(
+            platform,
+            SimpleNamespace(extra={}),
+            "chat-1",
+            "",
+            media_files=[],
+        )
+
+        assert "error" in result
+        assert "No message text or media files" in result["error"]
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_append_streaming_adapter_send_message_uses_plain_send(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platforms.base import SendResult
+
+        class FakeAppendStreamingAdapter:
+            APPENDS_STREAMING_MESSAGE_UPDATES = True
+
+            def __init__(self):
+                self.send = AsyncMock(
+                    return_value=SendResult(success=True, message_id="text-1")
+                )
+
+        platform = _FakePlatform("qqbot-plus")
+        adapter = FakeAppendStreamingAdapter()
+        runner = SimpleNamespace(adapters={platform: adapter}, _gateway_loop=None)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = await _send_via_adapter(
+            platform,
+            SimpleNamespace(extra={}),
+            "chat-1",
+            "caption",
+        )
+
+        assert result == {"success": True, "message_id": "text-1"}
+        adapter.send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="caption",
+            metadata={"streaming": False},
+        )
+
+    @pytest.mark.asyncio
     async def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):
         """Registry has hook, runner ref returns None: the hook is awaited."""
         from tools.send_message_tool import _send_via_adapter
@@ -2229,6 +2462,166 @@ class TestSendViaAdapterStandaloneFallback:
         assert result["success"] is True
         assert result["message_id"] == "abc-123"
         assert result["extra_field"] == "preserved"
+
+
+class TestDedicatedMediaTools:
+    def _configured_plugin_platform(self):
+        from gateway.config import Platform
+
+        platform = Platform("qqbot-plus")
+        pconfig = SimpleNamespace(enabled=True, token="***", extra={})
+        config = SimpleNamespace(
+            platforms={platform: pconfig},
+            get_home_channel=lambda _platform: None,
+        )
+        return platform, pconfig, config
+
+    @pytest.mark.parametrize(
+        ("tool_name", "path_arg", "file_name", "adapter_method", "adapter_path_arg"),
+        [
+            ("send_image_file", "image_path", "image.png", "send_image_file", "image_path"),
+            ("send_voice", "audio_path", "voice.ogg", "send_voice", "audio_path"),
+            ("send_video", "video_path", "clip.mp4", "send_video", "video_path"),
+            ("send_document", "file_path", "report.pdf", "send_document", "file_path"),
+        ],
+    )
+    def test_media_tool_routes_to_live_adapter_with_streaming_disabled(
+        self,
+        monkeypatch,
+        tmp_path,
+        tool_name,
+        path_arg,
+        file_name,
+        adapter_method,
+        adapter_path_arg,
+    ):
+        from gateway.platforms.base import SendResult
+        from tools.registry import registry
+
+        _platform, _pconfig, config = self._configured_plugin_platform()
+        media_path = tmp_path / file_name
+        media_path.write_bytes(b"media")
+
+        class FakeAdapter:
+            APPENDS_STREAMING_MESSAGE_UPDATES = True
+
+            def __init__(self):
+                self.calls = []
+
+            async def send_image_file(self, **kwargs):
+                self.calls.append(("send_image_file", kwargs))
+                return SendResult(success=True, message_id="image-1")
+
+            async def send_voice(self, **kwargs):
+                self.calls.append(("send_voice", kwargs))
+                return SendResult(success=True, message_id="voice-1")
+
+            async def send_video(self, **kwargs):
+                self.calls.append(("send_video", kwargs))
+                return SendResult(success=True, message_id="video-1")
+
+            async def send_document(self, **kwargs):
+                self.calls.append(("send_document", kwargs))
+                return SendResult(success=True, message_id="doc-1")
+
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(adapters={"qqbot-plus": adapter}, _gateway_loop=None)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                registry.dispatch(
+                    tool_name,
+                    {
+                        "target": "qqbot-plus:user-1",
+                        path_arg: str(media_path),
+                    },
+                )
+            )
+
+        assert result["success"] is True
+        assert adapter.calls == [
+            (
+                adapter_method,
+                {
+                    "chat_id": "user-1",
+                    adapter_path_arg: str(media_path),
+                    "metadata": {"streaming": False},
+                },
+            )
+        ]
+
+    def test_send_voice_tool_routes_non_ogg_audio_to_voice_method(self, monkeypatch, tmp_path):
+        from gateway.platforms.base import SendResult
+        from tools.registry import registry
+
+        _platform, _pconfig, config = self._configured_plugin_platform()
+        media_path = tmp_path / "voice.mp3"
+        media_path.write_bytes(b"media")
+
+        class FakeAdapter:
+            APPENDS_STREAMING_MESSAGE_UPDATES = True
+
+            def __init__(self):
+                self.send_voice = AsyncMock(
+                    return_value=SendResult(success=True, message_id="voice-1")
+                )
+                self.send_document = AsyncMock(
+                    return_value=SendResult(success=True, message_id="doc-1")
+                )
+
+        adapter = FakeAdapter()
+        runner = SimpleNamespace(adapters={"qqbot-plus": adapter}, _gateway_loop=None)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                registry.dispatch(
+                    "send_voice",
+                    {
+                        "target": "qqbot-plus:user-1",
+                        "audio_path": str(media_path),
+                    },
+                )
+            )
+
+        assert result["success"] is True
+        adapter.send_voice.assert_awaited_once_with(
+            chat_id="user-1",
+            audio_path=str(media_path),
+            metadata={"streaming": False},
+        )
+        adapter.send_document.assert_not_awaited()
+
+    def test_media_tool_rejects_empty_path_before_adapter_send(self, monkeypatch):
+        from tools.registry import registry
+
+        _platform, _pconfig, config = self._configured_plugin_platform()
+        adapter = SimpleNamespace(send_document=AsyncMock())
+        runner = SimpleNamespace(adapters={"qqbot-plus": adapter}, _gateway_loop=None)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            result = json.loads(
+                registry.dispatch(
+                    "send_document",
+                    {
+                        "target": "qqbot-plus:user-1",
+                        "file_path": "",
+                    },
+                )
+            )
+
+        assert "error" in result
+        assert "file_path" in result["error"]
+        adapter.send_document.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

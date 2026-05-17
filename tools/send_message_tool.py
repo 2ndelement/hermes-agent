@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -145,6 +146,46 @@ SEND_MESSAGE_SCHEMA = {
 }
 
 
+def _media_tool_schema(name, path_arg, description):
+    return {
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": SEND_MESSAGE_SCHEMA["parameters"]["properties"]["target"],
+                path_arg: {
+                    "type": "string",
+                    "description": "Local file path to send as a native platform attachment.",
+                },
+            },
+            "required": ["target", path_arg],
+        },
+    }
+
+
+SEND_IMAGE_FILE_SCHEMA = _media_tool_schema(
+    "send_image_file",
+    "image_path",
+    "Send a local image file through the connected messaging platform's native image/file support.",
+)
+SEND_VOICE_SCHEMA = _media_tool_schema(
+    "send_voice",
+    "audio_path",
+    "Send a local audio file as a voice message when the platform supports voice bubbles.",
+)
+SEND_VIDEO_SCHEMA = _media_tool_schema(
+    "send_video",
+    "video_path",
+    "Send a local video file through the connected messaging platform's native video/file support.",
+)
+SEND_DOCUMENT_SCHEMA = _media_tool_schema(
+    "send_document",
+    "file_path",
+    "Send a local file through the connected messaging platform's native document/file support.",
+)
+
+
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
     action = args.get("action", "send")
@@ -153,6 +194,37 @@ def send_message_tool(args, **kw):
         return _handle_list()
 
     return _handle_send(args)
+
+
+def _handle_media_tool(args, *, path_arg: str, voice: bool = False, force_document: bool = False):
+    target = args.get("target", "")
+    path = str(args.get(path_arg, "") or "").strip()
+    if not target:
+        return tool_error("'target' is required")
+    if not path:
+        return tool_error(f"'{path_arg}' is required")
+    message = f"MEDIA:{path}"
+    if voice:
+        message = f"[[audio_as_voice]]\n{message}"
+    if force_document:
+        message = f"[[as_document]]\n{message}"
+    return _handle_send({"action": "send", "target": target, "message": message})
+
+
+def send_image_file_tool(args, **kw):
+    return _handle_media_tool(args, path_arg="image_path")
+
+
+def send_voice_tool(args, **kw):
+    return _handle_media_tool(args, path_arg="audio_path", voice=True)
+
+
+def send_video_tool(args, **kw):
+    return _handle_media_tool(args, path_arg="video_path")
+
+
+def send_document_tool(args, **kw):
+    return _handle_media_tool(args, path_arg="file_path", force_document=True)
 
 
 def _handle_list():
@@ -350,6 +422,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
             return target_ref.strip(), None, True
+    if platform_name in {"qqbot", "qqbot-plus"} and target_ref.strip():
+        return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
@@ -454,22 +528,80 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
+    if not chunk.strip() and not media_files:
+        return {"error": "No message text or media files to send"}
+
     if runner is not None:
         try:
-            adapter = runner.adapters.get(platform)
+            adapters = runner.adapters
+            adapter = adapters.get(platform)
+            if adapter is None:
+                platform_name = platform.value if hasattr(platform, "value") else str(platform)
+                adapter = adapters.get(platform_name)
         except Exception:
             adapter = None
         if adapter is not None:
-            try:
+            async def _send_live_adapter():
                 metadata = {"thread_id": thread_id} if thread_id else None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                if getattr(adapter, "APPENDS_STREAMING_MESSAGE_UPDATES", False) is True:
+                    metadata = {**(metadata or {}), "streaming": False}
+                last_result = None
+                if chunk.strip():
+                    last_result = await adapter.send(
+                        chat_id=chat_id,
+                        content=chunk,
+                        metadata=metadata,
+                    )
+                    if not last_result.success:
+                        return {"error": f"Adapter send failed: {last_result.error}"}
+                for media_path, is_voice in media_files or []:
+                    ext = os.path.splitext(media_path)[1].lower()
+                    if ext in _IMAGE_EXTS and not force_document:
+                        last_result = await adapter.send_image_file(
+                            chat_id=chat_id,
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif is_voice and not force_document:
+                        last_result = await adapter.send_voice(
+                            chat_id=chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif ext in _VIDEO_EXTS and not force_document:
+                        last_result = await adapter.send_video(
+                            chat_id=chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    else:
+                        last_result = await adapter.send_document(
+                            chat_id=chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+                    if not last_result.success:
+                        return {"error": f"Adapter media send failed: {last_result.error}"}
+                if last_result is not None and last_result.success:
+                    return {"success": True, "message_id": last_result.message_id}
+                return {"success": True}
+
+            try:
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                current_loop = asyncio.get_running_loop()
+                if gateway_loop is not None and gateway_loop.is_running() and gateway_loop is not current_loop:
+                    future = asyncio.run_coroutine_threadsafe(
+                        _send_live_adapter(),
+                        gateway_loop,
+                    )
+                    return await asyncio.wrap_future(future)
+                return await _send_live_adapter()
             except asyncio.CancelledError:
                 raise
+            except concurrent.futures.CancelledError:
+                raise asyncio.CancelledError()
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
 
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     entry = None
@@ -685,19 +817,26 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    plugin_entry = None
+    try:
+        from gateway.platform_registry import platform_registry
+        plugin_entry = platform_registry.get(platform.value)
+    except Exception:
+        plugin_entry = None
+
     # --- Non-media platforms ---
-    if media_files and not message.strip():
+    if media_files and plugin_entry is None and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and plugin adapters; "
                 f"target {platform.value} had only media attachments"
             )
         }
     warning = None
-    if media_files:
+    if media_files and plugin_entry is None:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and plugin adapters"
         )
 
     last_result = None
@@ -1897,4 +2036,40 @@ registry.register(
     handler=send_message_tool,
     check_fn=_check_send_message,
     emoji="📨",
+)
+
+registry.register(
+    name="send_image_file",
+    toolset="messaging",
+    schema=SEND_IMAGE_FILE_SCHEMA,
+    handler=send_image_file_tool,
+    check_fn=_check_send_message,
+    emoji="🖼️",
+)
+
+registry.register(
+    name="send_voice",
+    toolset="messaging",
+    schema=SEND_VOICE_SCHEMA,
+    handler=send_voice_tool,
+    check_fn=_check_send_message,
+    emoji="🎙️",
+)
+
+registry.register(
+    name="send_video",
+    toolset="messaging",
+    schema=SEND_VIDEO_SCHEMA,
+    handler=send_video_tool,
+    check_fn=_check_send_message,
+    emoji="🎬",
+)
+
+registry.register(
+    name="send_document",
+    toolset="messaging",
+    schema=SEND_DOCUMENT_SCHEMA,
+    handler=send_document_tool,
+    check_fn=_check_send_message,
+    emoji="📎",
 )
