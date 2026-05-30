@@ -176,3 +176,50 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_auto_continue_persists_original_user_message(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.5")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "http://example.test/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "skill_view", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "skill_view", "content": "skill docs"},
+    ]
+
+    _CapturingAgent.last_run = None
+    result = await runner._run_agent(
+        message="重试",
+        context_prompt="",
+        history=history,
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "ok"
+    assert "[System note:" in _CapturingAgent.last_run["user_message"]
+    assert _CapturingAgent.last_run["user_message"].endswith("重试")
+    assert _CapturingAgent.last_run["persist_user_message"] == "重试"

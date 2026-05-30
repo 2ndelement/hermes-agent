@@ -314,6 +314,32 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["skills"][0]["name"] == "skill-a"
 
+    def test_unfiltered_list_is_limited_when_many_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(35):
+                _make_skill(
+                    tmp_path,
+                    f"skill-{i:02d}",
+                    frontmatter_extra=f"description: {'x' * 800}\n",
+                )
+            raw = skills_list()
+        result = json.loads(raw)
+        assert result["count"] == 35
+        assert len(result["skills"]) == 25
+        assert result["returned"] == 25
+        assert result["truncated"] is True
+        assert "category" in result["hint"]
+
+    def test_category_filter_returns_all_matching_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(35):
+                _make_skill(tmp_path, f"skill-{i:02d}", category="devops")
+            raw = skills_list(category="devops")
+        result = json.loads(raw)
+        assert result["count"] == 35
+        assert len(result["skills"]) == 35
+        assert result["truncated"] is False
+
     def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"

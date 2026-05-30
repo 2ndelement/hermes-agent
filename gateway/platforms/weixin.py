@@ -1181,6 +1181,7 @@ class WeixinAdapter(BasePlatformAdapter):
     # WeChat does not support editing sent messages — streaming must use the
     # fallback "send-final-only" path so the cursor (▉) is never left visible.
     SUPPORTS_MESSAGE_EDITING = False
+    SUPPORTS_NON_EDITING_TOOL_PROGRESS = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WEIXIN)

@@ -1087,8 +1087,22 @@ def _normalize_empty_agent_response(
     the case where the agent did work (api_calls > 0) but returned no text.
     Fix for #18765.
     """
-    if response:
+    response_is_empty_sentinel = response == "(empty)"
+    if response and not response_is_empty_sentinel:
         return response
+
+    if response_is_empty_sentinel:
+        messages = agent_result.get("messages") or []
+        saw_tool_result = any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            for msg in messages
+        )
+        if saw_tool_result:
+            return (
+                "⚠️ The model returned no response after processing tool "
+                "results. This can happen with some models — try again or "
+                "rephrase your question."
+            )
 
     if agent_result.get("failed"):
         error_detail = agent_result.get("error", "unknown error")
@@ -7608,17 +7622,6 @@ class GatewayRunner:
 
             response = agent_result.get("final_response") or ""
 
-            # Convert the agent's internal "(empty)" sentinel into a
-            # user-friendly message.  "(empty)" means the model failed to
-            # produce visible content after exhausting all retries (nudge,
-            # prefill, empty-retry, fallback).  Sending the raw sentinel
-            # looks like a bug; a short explanation is more helpful.
-            if response == "(empty)":
-                response = (
-                    "⚠️ The model returned no response after processing tool "
-                    "results. This can happen with some models — try again or "
-                    "rephrase your question."
-                )
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
@@ -14467,9 +14470,13 @@ class GatewayRunner:
                 return
 
             # Skip tool progress for platforms that don't support message
-            # editing (e.g. iMessage/BlueBubbles) — each progress update
-            # would become a separate message bubble, which is noisy.
-            if type(adapter).edit_message is BasePlatformAdapter.edit_message:
+            # editing unless the adapter explicitly opts into one-shot progress
+            # bubbles for non-editing transports.
+            _adapter_can_edit_progress = type(adapter).edit_message is not BasePlatformAdapter.edit_message
+            _adapter_can_send_non_editing_progress = bool(
+                getattr(adapter, "SUPPORTS_NON_EDITING_TOOL_PROGRESS", False)
+            )
+            if not _adapter_can_edit_progress and not _adapter_can_send_non_editing_progress:
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()
@@ -14479,7 +14486,11 @@ class GatewayRunner:
 
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            sends_separate_progress_bubbles = bool(
+                getattr(adapter, "APPENDS_STREAMING_MESSAGE_UPDATES", False)
+            )
+            can_edit = _adapter_can_edit_progress and not sends_separate_progress_bubbles
+            non_editing_progress_sent = False
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -14534,6 +14545,27 @@ class GatewayRunner:
                     else:
                         msg = raw
                         progress_lines.append(msg)
+
+                    if sends_separate_progress_bubbles:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            reply_to=_progress_reply_to,
+                            metadata=_progress_metadata,
+                        )
+                        if (
+                            _cleanup_progress
+                            and getattr(result, "success", False)
+                            and getattr(result, "message_id", None)
+                        ):
+                            _cleanup_msg_ids.append(str(result.message_id))
+                        progress_lines = []
+                        progress_msg_id = None
+                        _last_edit_ts = time.monotonic()
+                        await asyncio.sleep(0.3)
+                        if _run_still_current():
+                            await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        continue
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -14593,13 +14625,15 @@ class GatewayRunner:
                                 metadata=_progress_metadata,
                             )
                         else:
-                            # Editing unsupported: send just this line
+                            if non_editing_progress_sent:
+                                continue
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
+                            non_editing_progress_sent = True
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
                             if _cleanup_progress:

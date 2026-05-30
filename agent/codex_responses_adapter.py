@@ -813,7 +813,7 @@ def _extract_responses_message_text(item: Any) -> str:
         text = getattr(part, "text", None)
         if isinstance(text, str) and text:
             chunks.append(text)
-    return "".join(chunks).strip()
+    return "".join(chunks)
 
 
 def _extract_responses_reasoning_text(item: Any) -> str:
@@ -984,11 +984,11 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
 
-    final_text = "\n".join([p for p in content_parts if p]).strip()
-    if not final_text and hasattr(response, "output_text"):
+    final_text = "\n".join([p for p in content_parts if p])
+    if not final_text.strip() and hasattr(response, "output_text"):
         out_text = getattr(response, "output_text", "")
         if isinstance(out_text, str):
-            final_text = out_text.strip()
+            final_text = out_text
 
     # ── Tool-call leak recovery ──────────────────────────────────
     # gpt-5.x on the Codex Responses API sometimes degenerates and emits

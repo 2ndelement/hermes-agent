@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
@@ -189,7 +190,7 @@ class QQBotPlusAdapter(QQAdapter):
         *,
         finalize: bool,
     ) -> Dict[str, Any]:
-        if self._markdown_support and not chunk.endswith("\n"):
+        if finalize and self._markdown_support and not chunk.endswith("\n"):
             chunk += "\n"
         body = self._build_text_body(chunk, message_id or "qqbot-plus-stream")
         body.pop("message_reference", None)
@@ -345,17 +346,20 @@ class QQBotPlusAdapter(QQAdapter):
         self._prune_stream_state()
         if finalize and message_id and self._stream_finalized.get(message_id) == content:
             return SendResult(success=True, message_id=message_id, raw_response={})
+        if message_id and message_id not in self._stream_sent_text:
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error="Message is not a QQBot Plus streaming message",
+            )
         content = self._clean_stream_content(content)
         sent_text = self._stream_sent_text.get(message_id, "") if message_id else ""
         chunk = content
         if sent_text and content.startswith(sent_text):
             chunk = content[len(sent_text):]
-        if not chunk:
+        if not chunk and not finalize:
             self._stream_sent_text[message_id] = content
             self._stream_touched_at[message_id] = time.monotonic()
-            if finalize and message_id:
-                self._stream_finalized[message_id] = content
-                self._clear_stream_state(message_id)
             return SendResult(success=True, message_id=message_id, raw_response={})
         if finalize and not chunk.endswith("\n"):
             chunk += "\n"
@@ -370,8 +374,6 @@ class QQBotPlusAdapter(QQAdapter):
             data = await self._api_request("POST", path, body)
         except Exception as exc:
             self._log_stream_send_failure(exc, body)
-            if finalize and message_id:
-                self._clear_stream_state(message_id)
             raise
         response_id = str(data.get("id") or message_id or "")
         if response_id:
@@ -391,6 +393,13 @@ def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _mirror_legacy_auth_env() -> None:
+    if os.getenv("QQBOT_PLUS_ALLOWED_USERS") is None and os.getenv("QQ_ALLOWED_USERS"):
+        os.environ["QQBOT_PLUS_ALLOWED_USERS"] = os.getenv("QQ_ALLOWED_USERS", "")
+    if os.getenv("QQBOT_PLUS_ALLOW_ALL_USERS") is None and os.getenv("QQ_ALLOW_ALL_USERS"):
+        os.environ["QQBOT_PLUS_ALLOW_ALL_USERS"] = os.getenv("QQ_ALLOW_ALL_USERS", "")
+
+
 def _env_enablement() -> dict[str, Any] | None:
     app_id = os.getenv("QQBOT_PLUS_APP_ID", "").strip()
     client_secret = os.getenv("QQBOT_PLUS_CLIENT_SECRET", "").strip()
@@ -398,6 +407,7 @@ def _env_enablement() -> dict[str, Any] | None:
         return None
     if os.getenv("QQBOT_PLUS_ENABLED") and not _env_enabled("QQBOT_PLUS_ENABLED"):
         return None
+    _mirror_legacy_auth_env()
     seed: dict[str, Any] = {
         "app_id": app_id,
         "client_secret": client_secret,
@@ -425,7 +435,138 @@ def is_connected(config: PlatformConfig) -> bool:
     return validate_config(config)
 
 
+def interactive_setup() -> None:
+    from hermes_cli.setup import (
+        get_env_value,
+        print_header,
+        print_info,
+        print_success,
+        print_warning,
+        prompt,
+        prompt_yes_no,
+        save_env_value,
+    )
+
+    print_header("QQBot Plus")
+    existing_app_id = get_env_value("QQBOT_PLUS_APP_ID")
+    if existing_app_id:
+        print_info(f"QQBot Plus: already configured (app ID: {existing_app_id})")
+        if not prompt_yes_no("Reconfigure QQBot Plus?", False):
+            return
+
+    print_info("Create a QQ Bot application at q.qq.com, then paste its credentials below.")
+    print_info("QQBot Plus uses native QQ v2 append streaming for normal assistant replies.")
+    print()
+
+    app_id = prompt("QQBot Plus App ID", default=existing_app_id or "")
+    if not app_id:
+        print_warning("App ID is required — skipping QQBot Plus setup")
+        return
+    save_env_value("QQBOT_PLUS_APP_ID", app_id.strip())
+
+    client_secret = prompt(
+        "QQBot Plus client secret",
+        default=get_env_value("QQBOT_PLUS_CLIENT_SECRET") or "",
+        password=True,
+    )
+    if not client_secret:
+        print_warning("Client secret is required — skipping QQBot Plus setup")
+        return
+    save_env_value("QQBOT_PLUS_CLIENT_SECRET", client_secret.strip())
+    save_env_value("QQBOT_PLUS_ENABLED", "true")
+
+    home = prompt(
+        "QQBot Plus home channel (C2C or group openid, optional)",
+        default=get_env_value("QQBOT_PLUS_HOME_CHANNEL") or "",
+    )
+    save_env_value("QQBOT_PLUS_HOME_CHANNEL", home.strip() if home else "")
+
+    print()
+    print_info("Access control: restrict who can message the bot.")
+    allow_all = prompt_yes_no("Allow all QQBot Plus users?", False)
+    if allow_all:
+        save_env_value("QQBOT_PLUS_ALLOW_ALL_USERS", "true")
+        save_env_value("QQBOT_PLUS_ALLOWED_USERS", "")
+        print_warning("Open access — any QQ user who can message the bot can command it.")
+    else:
+        save_env_value("QQBOT_PLUS_ALLOW_ALL_USERS", "false")
+        allowed = prompt(
+            "Allowed QQBot Plus user openids (comma-separated)",
+            default=(
+                get_env_value("QQBOT_PLUS_ALLOWED_USERS")
+                or get_env_value("QQ_ALLOWED_USERS")
+                or ""
+            ),
+        )
+        save_env_value("QQBOT_PLUS_ALLOWED_USERS", allowed.replace(" ", "") if allowed else "")
+        if allowed:
+            print_success("Allowlist configured")
+        else:
+            print_info("No allowlist configured — use pairing approval or set QQBOT_PLUS_ALLOWED_USERS.")
+
+    print()
+    print_success("QQBot Plus configuration saved to ~/.hermes/.env")
+    print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    adapter = QQBotPlusAdapter(pconfig)
+    try:
+        if not await adapter.connect():
+            return {"error": "QQBot Plus standalone send: failed to connect"}
+        metadata = {"streaming": False}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        last_result: SendResult | None = None
+        if message.strip():
+            last_result = await adapter.send(chat_id, message, metadata=metadata)
+            if not last_result.success:
+                return {"error": f"QQBot Plus standalone send failed: {last_result.error}"}
+        for media_path, is_voice in media_files or []:
+            ext = Path(media_path).suffix.lower()
+            if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"} and not force_document:
+                last_result = await adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    metadata=metadata,
+                )
+            elif is_voice and not force_document:
+                last_result = await adapter.send_voice(
+                    chat_id=chat_id,
+                    audio_path=media_path,
+                    metadata=metadata,
+                )
+            elif ext in {".mp4", ".mov", ".avi", ".mkv", ".3gp"} and not force_document:
+                last_result = await adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=media_path,
+                    metadata=metadata,
+                )
+            else:
+                last_result = await adapter.send_document(
+                    chat_id=chat_id,
+                    file_path=media_path,
+                    metadata=metadata,
+                )
+            if not last_result.success:
+                return {"error": f"QQBot Plus standalone media send failed: {last_result.error}"}
+        if last_result is None:
+            return {"error": "QQBot Plus standalone send: no message text or media files"}
+        return {"success": True, "message_id": last_result.message_id}
+    finally:
+        await adapter.disconnect()
+
+
 def register(ctx: Any) -> None:
+    _mirror_legacy_auth_env()
     ctx.register_platform(
         name=QQBOT_PLUS_PLATFORM,
         label="QQBot Plus",
@@ -434,10 +575,13 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["QQBOT_PLUS_APP_ID", "QQBOT_PLUS_CLIENT_SECRET"],
+        install_hint="Configure with: hermes gateway setup → QQBot Plus",
+        setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
-        allowed_users_env="QQ_ALLOWED_USERS",
-        allow_all_env="QQ_ALLOW_ALL_USERS",
+        allowed_users_env="QQBOT_PLUS_ALLOWED_USERS",
+        allow_all_env="QQBOT_PLUS_ALLOW_ALL_USERS",
         cron_deliver_env_var="QQBOT_PLUS_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
         max_message_length=QQAdapter.MAX_MESSAGE_LENGTH,
         emoji="QQ",
         pii_safe=False,

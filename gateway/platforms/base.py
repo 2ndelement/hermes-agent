@@ -1565,6 +1565,8 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    SUPPORTS_NON_EDITING_TOOL_PROGRESS: bool = False
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close

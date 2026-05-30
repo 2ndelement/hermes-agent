@@ -54,6 +54,11 @@ def _config() -> SimpleNamespace:
     return SimpleNamespace(extra={}, enabled=True, home_channel=None, reply_to_mode="first")
 
 
+def _mark_connected(adapter) -> None:
+    adapter._running = True
+    adapter._ws = SimpleNamespace(closed=False)
+
+
 def test_register_adds_qqbot_plus_platform(clean_platform_registry):
     register(_PluginContext())
 
@@ -63,6 +68,91 @@ def test_register_adds_qqbot_plus_platform(clean_platform_registry):
     assert entry.name == "qqbot-plus"
     assert entry.label == "QQBot Plus"
     assert Platform("qqbot-plus").value == "qqbot-plus"
+
+
+def test_register_exposes_standard_bundled_platform_hooks(clean_platform_registry):
+    register(_PluginContext())
+
+    entry = platform_registry.get("qqbot-plus")
+
+    assert entry is not None
+    assert entry.install_hint
+    assert entry.setup_fn is _qqbot_plus.interactive_setup
+    assert entry.standalone_sender_fn is _qqbot_plus._standalone_send
+    assert entry.allowed_users_env == "QQBOT_PLUS_ALLOWED_USERS"
+    assert entry.allow_all_env == "QQBOT_PLUS_ALLOW_ALL_USERS"
+    assert entry.cron_deliver_env_var == "QQBOT_PLUS_HOME_CHANNEL"
+
+
+def test_interactive_setup_writes_plus_specific_env(monkeypatch):
+    import hermes_cli.setup as setup
+
+    saved = {}
+
+    def fake_get_env_value(name):
+        return ""
+
+    def fake_save_env_value(name, value):
+        saved[name] = value
+
+    def fake_prompt(question, default=None, password=False):
+        if "App ID" in question:
+            return "plus-app"
+        if "client secret" in question:
+            assert password is True
+            return "plus-secret"
+        if "home" in question.lower():
+            return "user-1"
+        if "Allowed" in question:
+            return "user-a, user-b"
+        return default or ""
+
+    def fake_prompt_yes_no(question, default=False):
+        if "Allow all" in question:
+            return False
+        return default
+
+    monkeypatch.setattr(setup, "get_env_value", fake_get_env_value)
+    monkeypatch.setattr(setup, "save_env_value", fake_save_env_value)
+    monkeypatch.setattr(setup, "prompt", fake_prompt)
+    monkeypatch.setattr(setup, "prompt_yes_no", fake_prompt_yes_no)
+    monkeypatch.setattr(setup, "print_header", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup, "print_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup, "print_warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup, "print_success", lambda *args, **kwargs: None)
+
+    _qqbot_plus.interactive_setup()
+
+    assert saved == {
+        "QQBOT_PLUS_APP_ID": "plus-app",
+        "QQBOT_PLUS_CLIENT_SECRET": "plus-secret",
+        "QQBOT_PLUS_ENABLED": "true",
+        "QQBOT_PLUS_HOME_CHANNEL": "user-1",
+        "QQBOT_PLUS_ALLOW_ALL_USERS": "false",
+        "QQBOT_PLUS_ALLOWED_USERS": "user-a,user-b",
+    }
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_uses_qqbot_plus_adapter(monkeypatch):
+    adapter = SimpleNamespace(
+        connect=AsyncMock(return_value=True),
+        disconnect=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg-1")),
+    )
+    monkeypatch.setattr(_qqbot_plus, "QQBotPlusAdapter", Mock(return_value=adapter))
+
+    result = await _qqbot_plus._standalone_send(_config(), "user-1", "hello")
+
+    assert result == {"success": True, "message_id": "msg-1"}
+    _qqbot_plus.QQBotPlusAdapter.assert_called_once_with(_config())
+    adapter.connect.assert_awaited_once()
+    adapter.send.assert_awaited_once_with(
+        "user-1",
+        "hello",
+        metadata={"streaming": False},
+    )
+    adapter.disconnect.assert_awaited_once()
 
 
 def test_adapter_advertises_append_streaming_capabilities():
@@ -176,10 +266,27 @@ def test_env_enablement_ignores_plain_qqbot_credentials():
         assert _qqbot_plus._env_enablement() is None
 
 
+def test_env_enablement_mirrors_legacy_auth_env_for_compatibility():
+    with patch.dict(
+        "os.environ",
+        {
+            "QQBOT_PLUS_APP_ID": "plus-app",
+            "QQBOT_PLUS_CLIENT_SECRET": "plus-secret",
+            "QQ_ALLOWED_USERS": "legacy-user",
+            "QQ_ALLOW_ALL_USERS": "true",
+        },
+        clear=True,
+    ):
+        seed = _qqbot_plus._env_enablement()
+        assert seed is not None
+        assert _qqbot_plus.os.environ["QQBOT_PLUS_ALLOWED_USERS"] == "legacy-user"
+        assert _qqbot_plus.os.environ["QQBOT_PLUS_ALLOW_ALL_USERS"] == "true"
+
+
 @pytest.mark.asyncio
 async def test_initial_send_uses_stream_protocol_for_text():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._api_request = AsyncMock(return_value={"id": "stream-1"})
 
     result = await adapter.send("user-1", "hello")
@@ -200,7 +307,7 @@ async def test_initial_send_uses_stream_protocol_for_text():
 @pytest.mark.asyncio
 async def test_send_with_harmless_metadata_still_uses_stream_protocol():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._api_request = AsyncMock(return_value={"id": "stream-1"})
 
     result = await adapter.send("user-1", "hello", metadata={"source": "gateway"})
@@ -218,7 +325,7 @@ async def test_send_with_harmless_metadata_still_uses_stream_protocol():
 @pytest.mark.asyncio
 async def test_send_with_streaming_false_uses_qq_text_send():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     metadata = {"streaming": False}
 
     with patch.object(_qqbot_plus.QQAdapter, "send", new=AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-1"))) as qq_send:
@@ -230,9 +337,23 @@ async def test_send_with_streaming_false_uses_qq_text_send():
 
 
 @pytest.mark.asyncio
+async def test_edit_unknown_message_id_does_not_use_stream_protocol():
+    adapter = QQBotPlusAdapter(_config())
+    _mark_connected(adapter)
+    adapter._api_request = AsyncMock(return_value={"id": "unexpected-stream"})
+
+    result = await adapter.edit_message("user-1", "text-1", "hello\nworld")
+
+    assert result.success is False
+    assert result.message_id == "text-1"
+    assert "not a QQBot Plus streaming message" in result.error
+    adapter._api_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_clarify_with_choices_uses_keyboard_not_streaming():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._api_request = AsyncMock(return_value={"id": "stream-1"})
     adapter.send_with_keyboard = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="clarify-1")
@@ -260,7 +381,7 @@ async def test_send_clarify_with_choices_uses_keyboard_not_streaming():
 @pytest.mark.asyncio
 async def test_send_clarify_open_ended_uses_non_streaming_text_send():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     metadata = {"source": "clarify"}
 
     with patch.object(_qqbot_plus.QQAdapter, "send", new=AsyncMock(return_value=SimpleNamespace(success=True, message_id="clarify-1"))) as qq_send:
@@ -285,7 +406,7 @@ async def test_send_clarify_open_ended_uses_non_streaming_text_send():
 @pytest.mark.asyncio
 async def test_send_clarify_keyboard_failure_marks_text_fallback():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter.send_with_keyboard = AsyncMock(
         return_value=SimpleNamespace(success=False, error="no keyboard")
     )
@@ -340,7 +461,7 @@ async def test_media_methods_reuse_qq_rich_media_upload_with_tool_metadata(
     kind,
 ):
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
 
     with patch.object(QQBotPlusAdapter, "_send_media", new=AsyncMock(return_value=SimpleNamespace(success=True, message_id="media-1"))) as send_media:
         result = await getattr(adapter, method_name)(
@@ -363,7 +484,7 @@ async def test_send_voice_uses_qq_voice_media_type():
     from gateway.platforms.qqbot.constants import MEDIA_TYPE_VOICE
 
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
 
     with patch.object(QQBotPlusAdapter, "_send_media", new=AsyncMock(return_value=SimpleNamespace(success=True, message_id="voice-1"))) as send_media:
         result = await adapter.send_voice(
@@ -379,14 +500,14 @@ async def test_send_voice_uses_qq_voice_media_type():
     assert args[3] == "voice"
 
 
-def test_stream_body_adds_newline_to_all_markdown_chunks():
+def test_stream_body_preserves_mid_paragraph_chunks_without_newline():
     adapter = QQBotPlusAdapter(_config())
 
-    middle = adapter._build_stream_body("hello", "stream-1", 1, finalize=False)
-    final = adapter._build_stream_body("world", "stream-1", 2, finalize=True)
+    middle = adapter._build_stream_body("中间段落", "stream-1", 1, finalize=False)
+    final = adapter._build_stream_body("结尾", "stream-1", 2, finalize=True)
 
-    assert middle["markdown"]["content"] == "hello\n"
-    assert final["markdown"]["content"] == "world\n"
+    assert middle["markdown"]["content"] == "中间段落"
+    assert final["markdown"]["content"] == "结尾\n"
 
 
 def test_stream_body_uses_generated_msg_seq():
@@ -411,7 +532,7 @@ def test_stream_path_url_encodes_chat_id():
 @pytest.mark.asyncio
 async def test_send_forwards_metadata_when_falling_back_to_qq_send():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._stream_path_for_chat = Mock(return_value=None)
     metadata = {"attachments": [{"id": "att-1"}]}
 
@@ -425,9 +546,9 @@ async def test_send_forwards_metadata_when_falling_back_to_qq_send():
 @pytest.mark.asyncio
 async def test_streaming_diff_ignores_gateway_cursor_suffix():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._api_request = AsyncMock(
-        side_effect=[{"id": "stream-1"}, {"id": "stream-1"}],
+        side_effect=[{"id": "stream-1"}, {"id": "stream-1"}, {"id": "stream-1"}],
     )
 
     await adapter.send("user-1", "你 ▉")
@@ -436,16 +557,19 @@ async def test_streaming_diff_ignores_gateway_cursor_suffix():
 
     bodies = [call.args[2] for call in adapter._api_request.await_args_list]
     chunks = [body["markdown"]["content"] for body in bodies]
+    states = [body["stream"]["state"] for body in bodies]
 
-    assert chunks == ["你\n", "好\n"]
+    assert chunks == ["你", "好", "\n"]
+    assert states == [1, 1, 10]
 
 
 @pytest.mark.asyncio
 async def test_streaming_sends_each_increment_without_background_coalescing():
     adapter = QQBotPlusAdapter(_config())
-    adapter._running = True
+    _mark_connected(adapter)
     adapter._api_request = AsyncMock(
         side_effect=[
+            {"id": "stream-1"},
             {"id": "stream-1"},
             {"id": "stream-1"},
             {"id": "stream-1"},
@@ -461,8 +585,8 @@ async def test_streaming_sends_each_increment_without_background_coalescing():
     chunks = [body["markdown"]["content"] for body in bodies]
     states = [body["stream"]["state"] for body in bodies]
 
-    assert chunks == ["你\n", "好\n", "啊\n"]
-    assert states == [1, 1, 1]
+    assert chunks == ["你", "好", "啊", "\n"]
+    assert states == [1, 1, 1, 10]
 
 
 @pytest.mark.asyncio
@@ -492,11 +616,13 @@ async def test_duplicate_finalize_for_same_content_is_idempotent():
 
     assert first.success is True
     assert second.success is True
-    adapter._api_request.assert_not_awaited()
+    adapter._api_request.assert_awaited_once()
+    body = adapter._api_request.await_args.args[2]
+    assert body["stream"]["state"] == 10
 
 
 @pytest.mark.asyncio
-async def test_finalize_without_new_content_does_not_send_newline_chunk():
+async def test_finalize_without_new_content_sends_terminal_stream_frame():
     adapter = QQBotPlusAdapter(_config())
     adapter._stream_sent_text["stream-1"] = "hello"
     adapter._stream_indices["stream-1"] = 1
@@ -506,7 +632,12 @@ async def test_finalize_without_new_content_does_not_send_newline_chunk():
     result = await adapter.edit_message("user-1", "stream-1", "hello", finalize=True)
 
     assert result.success is True
-    adapter._api_request.assert_not_awaited()
+    adapter._api_request.assert_awaited_once()
+    body = adapter._api_request.await_args.args[2]
+    assert body["stream"]["state"] == 10
+    assert body["stream"]["id"] == "stream-1"
+    assert body["stream"]["index"] == 1
+    assert body["markdown"]["content"] == "\n"
 
 
 @pytest.mark.asyncio

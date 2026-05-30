@@ -10,10 +10,12 @@ requires_env:
     description: "QQBot Plus app ID"
     prompt: "QQBot Plus app ID"
     password: false
+    url: "https://q.qq.com/"
   - name: QQBOT_PLUS_CLIENT_SECRET
     description: "QQBot Plus client secret"
     prompt: "QQBot Plus client secret"
     password: true
+    url: "https://q.qq.com/"
 optional_env:
   - name: QQBOT_PLUS_ENABLED
     description: "Enable QQBot Plus platform"
@@ -23,11 +25,19 @@ optional_env:
     description: "Default C2C or group openid for cron delivery"
     prompt: "QQBot Plus home channel"
     password: false
+  - name: QQBOT_PLUS_ALLOWED_USERS
+    description: "Comma-separated QQ user openids allowed to talk to QQBot Plus"
+    prompt: "Allowed QQBot Plus users"
+    password: false
+  - name: QQBOT_PLUS_ALLOW_ALL_USERS
+    description: "Allow any QQ user to talk to QQBot Plus (dev only)"
+    prompt: "Allow all QQBot Plus users? (true/false)"
+    password: false
   - name: QQ_ALLOWED_USERS
-    description: "Comma-separated QQ user openids allowed to talk to the bot"
-    prompt: "Allowed QQ users"
+    description: "Legacy QQ allowlist env still accepted for compatibility"
+    prompt: "Legacy QQ allowed users"
     password: false
   - name: QQ_ALLOW_ALL_USERS
-    description: "Allow any QQ user (dev only)"
-    prompt: "Allow all QQ users? (true/false)"
+    description: "Legacy QQ allow-all env still accepted for compatibility"
+    prompt: "Legacy allow all QQ users? (true/false)"
     password: false

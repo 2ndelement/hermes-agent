@@ -467,6 +467,18 @@ class QQAdapter(BasePlatformAdapter):
 
         while self._running:
             try:
+                if not self._ws or self._ws.closed:
+                    self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
+                    if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                        logger.error("[%s] Max reconnect attempts reached", self._log_tag)
+                        return
+                    if await self._reconnect(backoff_idx):
+                        backoff_idx = 0
+                        quick_disconnect_count = 0
+                    else:
+                        backoff_idx += 1
+                    continue
+
                 connect_time = time.monotonic()
                 await self._read_events()
                 backoff_idx = 0
@@ -510,7 +522,7 @@ class QQAdapter(BasePlatformAdapter):
                 else:
                     quick_disconnect_count = 0
 
-                self._mark_disconnected()
+                self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
                 self._fail_pending("Connection closed")
 
                 # Stop reconnecting for fatal codes
@@ -591,7 +603,7 @@ class QQAdapter(BasePlatformAdapter):
                 if not self._running:
                     return
                 logger.warning("[%s] WebSocket error: %s", self._log_tag, exc)
-                self._mark_disconnected()
+                self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
                 self._fail_pending("Connection interrupted")
 
                 if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
@@ -626,6 +638,10 @@ class QQAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Reconnect failed: %s", self._log_tag, exc)
             return False
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._running and self._ws and not self._ws.closed)
 
     async def _read_events(self) -> None:
         """Read WebSocket frames until connection closes."""

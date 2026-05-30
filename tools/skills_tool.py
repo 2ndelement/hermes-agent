@@ -91,6 +91,7 @@ SKILLS_DIR = HERMES_HOME / "skills"
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+DEFAULT_SKILLS_LIST_LIMIT = 25
 
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
@@ -724,13 +725,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
+        total_count = len(all_skills)
+        returned_skills = all_skills
+        truncated = False
+        if not category and total_count > DEFAULT_SKILLS_LIST_LIMIT:
+            returned_skills = all_skills[:DEFAULT_SKILLS_LIST_LIMIT]
+            truncated = True
+
+        hint = "Use skill_view(name) to see full content, tags, and linked files"
+        if truncated:
+            hint += "; list was truncated, use category to narrow results"
+
         return json.dumps(
             {
                 "success": True,
-                "skills": all_skills,
+                "skills": returned_skills,
                 "categories": categories,
-                "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "count": total_count,
+                "returned": len(returned_skills),
+                "truncated": truncated,
+                "hint": hint,
             },
             ensure_ascii=False,
         )

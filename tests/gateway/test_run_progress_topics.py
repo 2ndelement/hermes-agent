@@ -68,6 +68,12 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+class NonEditingToolProgressCaptureAdapter(ProgressCaptureAdapter):
+    SUPPORTS_MESSAGE_EDITING = False
+    SUPPORTS_NON_EDITING_TOOL_PROGRESS = True
+    edit_message = BasePlatformAdapter.edit_message
+
+
 class AppendStreamingProgressCaptureAdapter(ProgressCaptureAdapter):
     APPENDS_STREAMING_MESSAGE_UPDATES = True
     REQUIRES_EDIT_FINALIZE = True
@@ -117,7 +123,7 @@ class FakeAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
@@ -139,7 +145,7 @@ class LongPreviewAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback("tool.started", "terminal", self.LONG_CMD, {})
         time.sleep(0.35)
         return {
@@ -154,11 +160,52 @@ class DelayedProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback("tool.started", "terminal", "first command", {})
         time.sleep(0.45)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SlowMultipleProgressAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        self.tool_progress_callback("tool.started", "terminal", "first command", {})
+        time.sleep(2.0)
+        self.tool_progress_callback("tool.started", "browser_navigate", "https://example.com", {})
+        time.sleep(2.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class QQBotPlusFileProgressAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        for tool_name, preview in [
+            ("todo", "planning 3 task(s)"),
+            ("terminal", "date '+%Y-%m-%d %H:%M:%S %Z'; uname -a"),
+            ("todo", "updating 2 task(s)"),
+            ("write_file", "/root/multistep_task_test_report.md"),
+            ("todo", "updating 1 task(s)"),
+            ("read_file", "/root/multistep_task_test_report.md"),
+            ("todo", "completing 3 task(s)"),
+        ]:
+            self.tool_progress_callback("tool.started", tool_name, preview, {})
+            time.sleep(0.35)
         return {
             "final_response": "done",
             "messages": [],
@@ -171,7 +218,7 @@ class DelayedInterimAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.interim_assistant_callback("first interim")
         time.sleep(0.45)
         self.interim_assistant_callback("second interim")
@@ -293,6 +340,133 @@ async def test_run_agent_progress_disables_append_streaming_for_system_bubbles(m
     assert result["final_response"] == "done"
     assert adapter.sent
     assert adapter.sent[0]["metadata"]["streaming"] is False
+
+
+@pytest.mark.asyncio
+async def test_append_streaming_platform_sends_each_tool_progress_as_non_streaming_bubble(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = QQBotPlusFileProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.file_tools  # noqa: F401 - register file tool emojis
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    platform = Platform("qqbot-plus")
+    adapter = AppendStreamingProgressCaptureAdapter(platform=platform)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=platform,
+        chat_id="user-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-append-progress-files",
+        session_key="agent:main:qqbot-plus:dm:user-1",
+    )
+
+    assert result["final_response"] == "done"
+    progress_messages = [item["content"] for item in adapter.sent]
+    assert any("write_file" in message for message in progress_messages)
+    assert any("read_file" in message for message in progress_messages)
+    assert len(progress_messages) == 7
+    assert adapter.edits == []
+    assert all(item["metadata"]["streaming"] is False for item in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_non_editing_platform_can_send_tool_started_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
+
+    adapter = NonEditingToolProgressCaptureAdapter(platform=Platform.WEIXIN)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.WEIXIN,
+        chat_id="wx-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-weixin-progress",
+        session_key="agent:main:weixin:dm:wx-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == '💻 terminal: "pwd"'
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_non_editing_platform_sends_only_first_tool_started_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = SlowMultipleProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
+
+    adapter = NonEditingToolProgressCaptureAdapter(platform=Platform.WEIXIN)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.WEIXIN,
+        chat_id="wx-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-weixin-progress-once",
+        session_key="agent:main:weixin:dm:wx-1",
+    )
+
+    assert result["final_response"] == "done"
+    progress_messages = [item["content"] for item in adapter.sent]
+    assert progress_messages == ['💻 terminal: "first command"']
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio
@@ -537,7 +711,7 @@ class CommentaryAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
         time.sleep(0.1)
@@ -555,7 +729,7 @@ class PreviewedResponseAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.interim_assistant_callback:
             self.interim_assistant_callback("You're welcome.", already_streamed=False)
         return {
@@ -572,7 +746,7 @@ class StreamingRefineAgent:
         self.model = "test-model"
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.stream_delta_callback:
             self.stream_delta_callback("Continuing to refine:")
         time.sleep(0.1)
@@ -593,7 +767,7 @@ class ReasoningOnlyAgent:
         self.reasoning_callback = kwargs.get("reasoning_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.reasoning_callback:
             self.reasoning_callback("Only reasoning.")
         return {
@@ -611,7 +785,7 @@ class ReasoningThenStreamingAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.reasoning_callback:
             self.reasoning_callback("Check ```constraints```.")
         if self.stream_delta_callback:
@@ -631,7 +805,7 @@ class UnsafeReasoningThenStreamingAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.reasoning_callback:
             self.reasoning_callback(
                 "Before <memory-context>hidden system context</memory-context> "
@@ -654,7 +828,7 @@ class SplitWhitespaceReasoningAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.reasoning_callback:
             self.reasoning_callback("Step")
             self.reasoning_callback(" ")
@@ -678,7 +852,7 @@ class ResumedReasoningAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.reasoning_callback:
             self.reasoning_callback("First thought.")
         if self.stream_delta_callback:
@@ -703,7 +877,7 @@ class QueuedCommentaryAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1 and self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
@@ -719,7 +893,7 @@ class BackgroundReviewAgent:
         self.background_review_callback = kwargs.get("background_review_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.background_review_callback:
             self.background_review_callback("💾 Skill 'prospect-scanner' created.")
         return {
@@ -737,7 +911,7 @@ class VerboseAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback(
             "tool.started", "execute_code", None,
             {"code": self.LONG_CODE},

@@ -621,6 +621,10 @@ class TestWeixinStreamingCursorSuppression:
         adapter = _make_adapter()
         assert adapter.SUPPORTS_MESSAGE_EDITING is False
 
+    def test_supports_non_editing_tool_progress(self):
+        adapter = _make_adapter()
+        assert adapter.SUPPORTS_NON_EDITING_TOOL_PROGRESS is True
+
 
 class TestWeixinMediaBuilder:
     """Media builder uses base64(hex_key), not base64(raw_bytes) for aes_key."""

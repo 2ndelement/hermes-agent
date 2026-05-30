@@ -125,6 +125,22 @@ def _codex_incomplete_message_response(text: str):
     )
 
 
+def _codex_max_output_incomplete_response(text: str):
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                status="incomplete",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=4096, total_tokens=4100),
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        model="gpt-5-codex",
+    )
+
+
 def _codex_commentary_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -495,6 +511,26 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["final_response"] == "OK"
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["content"] == "OK"
+
+
+def test_run_conversation_codex_continues_after_max_output_incomplete_text(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_max_output_incomplete_response("Partial answer"),
+        _codex_message_response(" completed."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    result = agent.run_conversation("Explain something")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Partial answer completed."
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("finish_reason") == "incomplete"
+        and msg.get("content") == "Partial answer"
+        for msg in result["messages"]
+    )
 
 
 def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):

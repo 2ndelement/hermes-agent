@@ -3315,10 +3315,85 @@ class TestRunConversation:
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
 
-    def test_truncated_tool_args_detected_when_finish_reason_not_length(self, agent):
-        """When a router rewrites finish_reason from 'length' to 'tool_calls',
-        truncated JSON arguments should still be detected and refused rather
-        than wasting 3 retry attempts."""
+    def test_truncated_tool_call_retry_boosts_output_tokens(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 512
+        agent.valid_tool_names.add("web_extract")
+        bad_tc = _mock_tool_call(
+            name="web_extract",
+            arguments='{"urls":["https://skills.sh/nicepkg/ai-workflow/a-share-analysis","https://skill',
+            call_id="c1",
+        )
+        good_tc = _mock_tool_call(
+            name="web_extract",
+            arguments='{"urls":["https://skills.sh/nicepkg/ai-workflow/a-share-analysis"]}',
+            call_id="c2",
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="length", tool_calls=[bad_tc]),
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[good_tc]),
+            final_resp,
+        ]
+
+        seen_max_tokens = []
+        original_build_api_kwargs = agent._build_api_kwargs
+
+        def capture_build_api_kwargs(api_messages):
+            kwargs = original_build_api_kwargs(api_messages)
+            seen_max_tokens.append(kwargs.get("max_tokens") or kwargs.get("max_completion_tokens"))
+            return kwargs
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=capture_build_api_kwargs),
+            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("extract skill pages")
+
+        assert result["final_response"] == "Done!"
+        assert seen_max_tokens[:2] == [512, 1024]
+
+    def test_truncated_tool_args_with_tool_calls_finish_reason_retries_once(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[bad_tc],
+        )
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[good_tc],
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            truncated_resp, good_resp, final_resp,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done!"
+        mock_hfc.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 3
+
+    def test_truncated_tool_args_with_tool_calls_finish_reason_refuses_after_retry(self, agent):
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
@@ -3343,6 +3418,7 @@ class TestRunConversation:
         assert result["partial"] is True
         assert "truncated due to output length limit" in result["error"]
         mock_handle_function_call.assert_not_called()
+        assert agent.client.chat.completions.create.call_count == 2
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must call kanban_block when iteration
@@ -4652,6 +4728,42 @@ class TestStreamingApiCall:
         assert tc[0].function.arguments == '{"q":"hello"}'
         assert tc[1].function.name == "read"
         assert tc[1].function.arguments == '{}'
+
+    def test_reused_index_new_function_name_without_id_starts_new_tool_call(self, agent):
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc_delta(0, "", "skills_list", '{"category":""}')]),
+            _make_chunk(tool_calls=[_make_tc_delta(0, "", "terminal", '{"command":"npx skills find investing"}')]),
+            _make_chunk(finish_reason="tool_calls"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        tc = resp.choices[0].message.tool_calls
+        assert len(tc) == 2
+        assert tc[0].function.name == "skills_list"
+        assert tc[0].function.arguments == '{"category":""}'
+        assert tc[1].function.name == "terminal"
+        assert tc[1].function.arguments == '{"command":"npx skills find investing"}'
+        assert resp.choices[0].finish_reason == "tool_calls"
+
+    def test_reused_index_same_function_after_complete_json_starts_new_tool_call(self, agent):
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc_delta(0, "", "skills_list", '{"category":"personal-finance-coach"}')]),
+            _make_chunk(tool_calls=[_make_tc_delta(0, "", "skills_list", '{"category":"investment-analyzer"}')]),
+            _make_chunk(finish_reason="tool_calls"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        tc = resp.choices[0].message.tool_calls
+        assert len(tc) == 2
+        assert tc[0].function.name == "skills_list"
+        assert tc[0].function.arguments == '{"category":"personal-finance-coach"}'
+        assert tc[1].function.name == "skills_list"
+        assert tc[1].function.arguments == '{"category":"investment-analyzer"}'
+        assert resp.choices[0].finish_reason == "tool_calls"
 
     def test_content_and_tool_calls_together(self, agent):
         chunks = [

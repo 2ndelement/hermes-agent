@@ -417,6 +417,43 @@ class TestGatewaySurfacesNullResponse:
 
         assert result == "Hello!"
 
+    def test_empty_sentinel_without_tools_uses_generic_empty_response(self):
+        """Model empty response without tool messages should not blame tool results."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "(empty)",
+            "api_calls": 4,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "(empty)", history_len=0,
+        )
+
+        assert "no response was generated" in result
+        assert "processing tool results" not in result
+
+    def test_empty_sentinel_after_tools_mentions_tool_results(self):
+        """Keep the more specific hint when the empty response followed tool results."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "(empty)",
+            "api_calls": 4,
+            "messages": [
+                {"role": "user", "content": "search"},
+                {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ],
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "(empty)", history_len=0,
+        )
+
+        assert "processing tool results" in result
+
 
 # ===========================================================================
 # Prune: finalize_orphaned_compression_sessions

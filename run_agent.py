@@ -8009,6 +8009,21 @@ class AIAgent:
                         if tc_delta.id:
                             entry["id"] = tc_delta.id
                         if tc_delta.function:
+                            if (
+                                tc_delta.function.name
+                                and entry["function"]["name"]
+                                and tc_delta.function.name != entry["function"]["name"]
+                            ):
+                                new_slot = max(tool_calls_acc, default=-1) + 1
+                                _active_slot_by_idx[raw_idx] = new_slot
+                                tool_calls_acc[new_slot] = {
+                                    "id": tc_delta.id or "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                    "extra_content": None,
+                                }
+                                entry = tool_calls_acc[new_slot]
+                                idx = new_slot
                             if tc_delta.function.name:
                                 # Use assignment, not +=.  Function names are
                                 # atomic identifiers delivered complete in the
@@ -8020,6 +8035,25 @@ class AIAgent:
                                 # Vercel AI patterns) is immune to this.
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
+                                if entry["function"]["arguments"]:
+                                    try:
+                                        json.loads(entry["function"]["arguments"])
+                                    except json.JSONDecodeError:
+                                        pass
+                                    else:
+                                        new_slot = max(tool_calls_acc, default=-1) + 1
+                                        _active_slot_by_idx[raw_idx] = new_slot
+                                        tool_calls_acc[new_slot] = {
+                                            "id": tc_delta.id or "",
+                                            "type": "function",
+                                            "function": {
+                                                "name": entry["function"]["name"],
+                                                "arguments": "",
+                                            },
+                                            "extra_content": None,
+                                        }
+                                        entry = tool_calls_acc[new_slot]
+                                        idx = new_slot
                                 entry["function"]["arguments"] += tc_delta.function.arguments
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
@@ -12817,17 +12851,9 @@ class AIAgent:
 
                     # Check finish_reason before proceeding
                     if self.api_mode == "codex_responses":
-                        status = getattr(response, "status", None)
-                        incomplete_details = getattr(response, "incomplete_details", None)
-                        incomplete_reason = None
-                        if isinstance(incomplete_details, dict):
-                            incomplete_reason = incomplete_details.get("reason")
-                        else:
-                            incomplete_reason = getattr(incomplete_details, "reason", None)
-                        if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
-                            finish_reason = "length"
-                        else:
-                            finish_reason = "stop"
+                        _codex_result = self._get_transport().normalize_response(response)
+                        finish_reason = _codex_result.finish_reason
+                        assistant_message = _codex_result
                     elif self.api_mode == "anthropic_messages":
                         _tfr = self._get_transport()
                         finish_reason = _tfr.map_finish_reason(response.stop_reason)
@@ -12981,6 +13007,8 @@ class AIAgent:
                             if assistant_message is not None and _trunc_has_tool_calls:
                                 if truncated_tool_call_retries < 1:
                                     truncated_tool_call_retries += 1
+                                    _boost_base = self.max_tokens if self.max_tokens else 4096
+                                    self._ephemeral_max_output_tokens = min(_boost_base * 2, 32768)
                                     self._vprint(
                                         f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
                                         force=True,
@@ -14492,7 +14520,19 @@ class AIAgent:
                     self._codex_incomplete_retries += 1
 
                     interim_msg = self._build_assistant_message(assistant_message, finish_reason)
-                    interim_has_content = bool((interim_msg.get("content") or "").strip())
+                    interim_content = interim_msg.get("content") or ""
+                    interim_has_content = bool(interim_content.strip())
+                    incomplete_details = getattr(response, "incomplete_details", None)
+                    if isinstance(incomplete_details, dict):
+                        incomplete_reason = incomplete_details.get("reason")
+                    else:
+                        incomplete_reason = getattr(incomplete_details, "reason", None)
+                    if (
+                        incomplete_reason in {"max_output_tokens", "length"}
+                        and interim_has_content
+                        and not getattr(assistant_message, "tool_calls", None)
+                    ):
+                        truncated_response_prefix += interim_content
                     interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                     interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                     interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
@@ -14642,9 +14682,19 @@ class AIAgent:
                             if tc.function.name in {n for n, _ in invalid_json_args}
                         )
                         if _truncated:
+                            if truncated_tool_call_retries < 1:
+                                truncated_tool_call_retries += 1
+                                _boost_base = self.max_tokens if self.max_tokens else 4096
+                                self._ephemeral_max_output_tokens = min(_boost_base * 2, 32768)
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Truncated tool call arguments detected "
+                                    f"(finish_reason={finish_reason!r}) — retrying API call...",
+                                    force=True,
+                                )
+                                continue
                             self._vprint(
                                 f"{self.log_prefix}⚠️  Truncated tool call arguments detected "
-                                f"(finish_reason={finish_reason!r}) — refusing to execute.",
+                                f"again (finish_reason={finish_reason!r}) — refusing to execute.",
                                 force=True,
                             )
                             self._invalid_json_retries = 0
